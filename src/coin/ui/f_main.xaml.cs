@@ -1,4 +1,4 @@
-﻿/*######   Copyright (c) 2011-2018 Ufasoft  http://ufasoft.com  mailto:support@ufasoft.com,  Sergey Pavlov  mailto:dev@ufasoft.com ####
+﻿/*######   Copyright (c) 2011-2019 Ufasoft  http://ufasoft.com  mailto:support@ufasoft.com,  Sergey Pavlov  mailto:dev@ufasoft.com ####
 #                                                                                                                                     #
 #       See LICENSE for licensing information                                                                                         #
 #####################################################################################################################################*/
@@ -54,11 +54,7 @@ namespace Coin {
         Dictionary<IWallet, WalletForms> m_wallet2forms = new Dictionary<IWallet, WalletForms>();
         Dictionary<string, int> AllAlerts = new Dictionary<string, int>();
 
-        public static RegistryKey UserAppRegistryKey {
-            get {
-                return Registry.CurrentUser.CreateSubKey(@"Software\Ufasoft\Coin");
-            }
-        }
+        public static RegistryKey UserAppRegistryKey => Registry.CurrentUser.CreateSubKey(@"Software\Ufasoft\Coin");
 
         public class WalletEvent {
             public DateTime Timestamp { get; set; }
@@ -136,7 +132,6 @@ namespace Coin {
             UserAppRegistryKey.SetValue("ActiveCurrencies", list.ToArray());
         }
 
-
         void Currency_CheckChanged(object s, RoutedEventArgs e) {
             var wf1 = (WalletForms)((MenuItem)s).Tag;
             if (wf1.MenuItem.IsChecked) {
@@ -186,8 +181,7 @@ namespace Coin {
             return "";
         }
 
-        private void Window_Loaded(object sender, RoutedEventArgs e) {            
-            MenuDBMode.IsEnabled = false;       //!!! Until testing of Lite mode
+        private void Window_Loaded(object sender, RoutedEventArgs e) {
             MenuModeFull.Tag = EEngMode.Bootstrap;
             MenuModeLite.Tag = EEngMode.Lite;
 
@@ -210,6 +204,9 @@ namespace Coin {
                 }
             }
 
+            if (App.Testnet)
+                Eng.Testnet = App.Testnet;
+
             Wallet[] wallets = null;
             try {
                 wallets = Eng.Wallets;
@@ -227,7 +224,7 @@ namespace Coin {
                 MenuItem mi = new MenuItem();
                 wf.MenuItem = mi;
                 mi.Header = $"{wallet.CurrencySymbol}  {currencyName}";
-                mi.Icon = new Image() { Source = new BitmapImage(new Uri($"images/{currencyName}.ico", UriKind.Relative)) };
+                mi.Icon = new Image() { Source = new BitmapImage(new Uri($"images/{Regex.Replace(currencyName, @"-testnet\d?", "")}.ico", UriKind.Relative)) };
                 menuCurrency.Items.Add(mi);
                 mi.Template = menuTemplate;
                 mi.IsCheckable = true;
@@ -268,9 +265,7 @@ namespace Coin {
                 //!!!R              foreach (var de in m_wallet2forms)
                 //!!!R                  ar.Add(de.Value);
             } else {
-                foreach (var s in (string[])obj) {
-                    string[] ss = s.Split();
-                    string name = ss[0];
+                foreach (var name in (string[])obj) {
                     try {
                         WalletForms wf = null;
                         foreach (var pp in m_wallet2forms)
@@ -295,6 +290,9 @@ namespace Coin {
             m_Loaded = true;
             UpdateView();
             CheckForCommands();
+
+            if (LvWallet.SelectedItem == null && LvWallet.Items.Count == 1)
+                LvWallet.SelectedIndex = 0;
 //          RegisterUriHandler();
         }
 
@@ -364,36 +362,28 @@ namespace Coin {
             }
         }
 
-        WalletForms SelectedWallet() {
-            return (WalletForms)LvWallet.SelectedItem;
-        }
+        WalletForms SelectedWallet() => (WalletForms)LvWallet.SelectedItem;
 
-        WalletForms SelectedWalletNotNull() {
-            WalletForms r = (WalletForms)LvWallet.SelectedItem;
-            if (r == null)
-                throw new ApplicationException("No Currency selected in the List");
-            return r;
-        }
+        WalletForms SelectedWalletNotNull() =>
+			(WalletForms)LvWallet.SelectedItem ?? throw new ApplicationException("No Currency selected in the List");
 
-        WalletForms FindWallet(string netName) {
-            var r = ActiveWalletForms.FirstOrDefault(w => w.Wallet.CurrencyName.ToUpper() == netName.ToUpper());
-            if (r == null)
-                throw new ApplicationException($"No active Wallet with name {netName}");
-            return r;
-        }
+        WalletForms FindWallet(string netName) =>
+            ActiveWalletForms.FirstOrDefault(w => w.Wallet.CurrencyName.ToUpper() == netName.ToUpper())
+				?? throw new ApplicationException($"No active Wallet with name {netName}");
 
         public void SendMoney(string netName, string address, decimal amount, string label, string comment) {
             var dlg = new FormSendMoney();
-            dlg.CtlSend.Wallet = FindWallet(netName).Wallet;
+			var ctlSend = dlg.CtlSend;
+			ctlSend.Wallet = FindWallet(netName).Wallet;
             try {
-                dlg.CtlSend.Wallet.AddRecipient(address, label);
+                ctlSend.Wallet.AddRecipient(address, label);
             } catch (Exception) {
             }
             if (comment == "")
                 comment = label;
-            dlg.CtlSend.textAddress.Text = address;
-            dlg.CtlSend.textAmount.Text = amount.ToString();
-            dlg.CtlSend.textComment.Text = comment;
+            ctlSend.textAddress.Text = address;
+            ctlSend.textAmount.Text = amount.ToString();
+            ctlSend.textComment.Text = comment;
             Dialog.ShowDialog(dlg, this);
         }
 
@@ -449,13 +439,14 @@ namespace Coin {
 
         void ShowTransactions() {
             WalletForms wf = SelectedWallet();
-            if (wf.FormTransactions == null) {
-                wf.FormTransactions = new FormTransactions();
-                wf.FormTransactions.CtlTxes.WalletForms = wf;
-                wf.FormTransactions.CtlTxes.InitLoaded();
+			if (!(wf.FormTransactions is FormTransactions form)) {
+                wf.FormTransactions = form = new FormTransactions();
+				form.Title = wf.CurrencySymbol + " " + wf.FormTransactions.Title;
+				form.CtlTxes.WalletForms = wf;
+                form.CtlTxes.InitLoaded();
             }
-            wf.FormTransactions.Show();
-            wf.FormTransactions.Activate();
+            form.Show();
+            form.Activate();
         }
 
         private void OnTransactions(object sender, RoutedEventArgs e) {
@@ -506,10 +497,6 @@ namespace Coin {
         }
 
         void OnFileImport(object sender, RoutedEventArgs e) {
-            //          Eng.Password = "1"; //!!!D
-//                      Eng.ImportWallet("C:\\work\\coin\\wallet.dat", "123"); //!!D
-//                      return; //!!D
-
             if (!EnsurePassphraseUnlock())
                 return;
             var wf = SelectedWalletNotNull();
@@ -527,14 +514,14 @@ namespace Coin {
                                 break;
                             case 2:
                             case 3:
-                                using (TextReader rd = new StreamReader(d.FileName)) {
-                                    for (string key; (key=rd.ReadLine())!=null;) {
-                                        wf.Wallet.ImportPrivateKey(key.Trim(), password);
-                                    }
-                                }
+                                foreach (var key in File.ReadAllLines(d.FileName))
+                                    wf.Wallet.ImportPrivateKey(key.Trim(), password);
                                 break;
                         }
-                    } catch (Exception) {       //!!!TODO check exception type
+                        break;
+                    } catch (Exception ex) {
+                        if (ex.HResult != (int)Err.InvalidPassword)
+                            throw;
                         var dlg = new FormPassphrase();
                         dlg.labelRetype.Visibility = Visibility.Hidden;
                         dlg.textRetype.Visibility = Visibility.Hidden;
@@ -560,7 +547,7 @@ namespace Coin {
                 return;
             var d = new SaveFileDialog();
             d.InitialDirectory = Eng.AppDataDirectory;
-            d.Filter = "Bitcoin Wallet format|wallet.dat|Ufasoft Coin XML|*.xml";
+            d.Filter = "Bitcoin Wallet format|wallet.dat";
             d.FileName = "wallet-backup";
             if (Dialog.ShowDialog(d, this)) {
                 if (File.Exists(d.FileName))
@@ -631,11 +618,9 @@ namespace Coin {
             ContextMenu menu = (ContextMenu)sender;
             var wf = SelectedWallet();
             menu.DataContext = wf;
-/*
             MenuDBMode.IsEnabled = wf != null;
             if (MenuDBMode.IsEnabled)
                 SetMenuDBMode();
-*/
         }
 
         private void menuMining_Checked(object sender, RoutedEventArgs e) {
@@ -677,17 +662,24 @@ namespace Coin {
             }
         }
 
-        public Uri IconUri { get { return new Uri("images/" + Wallet.CurrencyName + ".ico", UriKind.Relative); } }
-        public string CurrencySymbol { get { return Wallet.CurrencySymbol; } }
-        public string Balance { get { return Wallet.Balance.ToString("0.########"); } }
-        public string BlockHeight =>  Wallet.LastBlock.ToString("n0", CultureInfo.InvariantCulture);
-        public string State { get { return Wallet.State; } }
-        public int Peers { get { return Wallet.Peers; } }
-        public bool MiningEnabled { get { return Wallet.MiningEnabled; } set { Wallet.MiningEnabled = value; } }
-        public bool MiningAllowed { get { return Wallet.MiningAllowed; } }
 
-        public bool LiteModeEnabled { get { return Wallet.Mode == EEngMode.Lite; } set { Wallet.Mode = value ? EEngMode.Lite : (Wallet.CurrencySymbol=="BTC" ? EEngMode.Bootstrap : EEngMode.Normal); } }
-        public bool LiteModeAllowed { get { return Wallet.LiteModeAllowed; } }
+
+        public Uri IconUri => new Uri("images/" + Regex.Replace(Wallet.CurrencyName, @"-testnet\d?", "") + ".ico", UriKind.Relative);
+        public string CurrencySymbol => Wallet.CurrencySymbol;
+        public string Balance => Wallet.Balance.ToString("0.########");
+        public string BlockHeight => Wallet.LastBlock.ToString("n0", CultureInfo.InvariantCulture);
+        public string State => Wallet.State;
+        public int Peers => Wallet.Peers;
+        public bool MiningEnabled { get => Wallet.MiningEnabled;  set => Wallet.MiningEnabled = value; }
+        public bool MiningAllowed => Wallet.MiningAllowed;
+
+        public bool LiteModeEnabled {
+            get => Wallet.Mode == EEngMode.Lite;
+            set {
+                Wallet.Mode = value ? EEngMode.Lite : (Wallet.CurrencySymbol == "BTC" ? EEngMode.Bootstrap : EEngMode.Normal);
+            }
+        }
+        public bool LiteModeAllowed => Wallet.LiteModeAllowed;
 
         public bool CheckForChanges() {
             bool r = Wallet.GetAndResetStateChangedFlag();
@@ -710,9 +702,7 @@ namespace Coin {
             _handle = handle;
         }
 
-        public IntPtr Handle {
-            get { return _handle; }
-        }
+        public IntPtr Handle => _handle;
     }
 
     public class MyImageConverter : IValueConverter {

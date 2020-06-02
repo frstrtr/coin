@@ -156,7 +156,8 @@ void KVStorage::Init() {
 }
 
 KVStorage::~KVStorage() {
-	switch (m_state) {
+	OpenState state = m_state;
+	switch (state) {
 	case OpenState::Closing:
 		m_futClose.wait();
 		break;
@@ -704,10 +705,10 @@ Page KVStorage::Allocate(bool bLock) {
 		AdjustViewCount();
 	}
 	if (UseMMapPager && FileLength < PageSpaceSize()) {
-		//FileIncrement = min(FileIncrement*2, uint64_t(1024*1024*1024));
-		FileIncrement *= 2;
-
-		m_pager->AddFullMapping((PageSpaceSize() + FileIncrement - 1) & ~(FileIncrement - 1));
+		const uint64_t MAX_INCREMENT = 1024 * 1024 * 1024;
+		FileIncrement = (min)(MAX_INCREMENT, FileIncrement * 2);
+		uint64_t newFileSize = (PageSpaceSize() + FileIncrement - 1) / FileIncrement * FileIncrement;
+		m_pager->AddFullMapping(newFileSize);
 		DbFile.Flush();			// save Metadata
 
 #ifdef X_DEBUG//!!!D
@@ -770,12 +771,12 @@ void KVStorage::DoClose(bool bLock) {
 		DbFile.Length = PageSpaceSize();
 	DbFile.Close();
 	m_bModified = false;
-	m_state = OpenState::Closed;
 	EXT_LOCK(MtxFreePages) {
 		CurGen.reset();
 		ReleasedPages.clear();
 		FreePages.clear();
 	}
+	m_state = OpenState::Closed;
 	m_nextFreePages.clear();
 #if UCFG_DB_FREE_PAGES_BITSET
 	FreePagesBitset.clear();
@@ -858,7 +859,7 @@ void DbTransactionBase::InitReadOnly() {
 		TransactionId = Storage.LastTransactionId;
 		MainTableRoot = Storage.MainTableRoot;
 		SnapshotGen = Storage.CurGen;
-	}	
+	}
 }
 
 Page DbTransactionBase::OpenPage(uint32_t pgno) {
@@ -908,7 +909,7 @@ void DbTransaction::FreePage(uint32_t pgno) {
 Page DbTransaction::Allocate(PageAlloc pa, Page *pCopyFrom) {
 	Page r = Storage.Allocate();
 	r.ClearEntries(); //!!!?
-	r.m_pimpl->Dirty = true;
+	r->Dirty = true;
 	AllocatedPages.insert(r.N);
 	switch (pa) {
 	case PageAlloc::Leaf:
@@ -930,16 +931,16 @@ Page DbTransaction::Allocate(PageAlloc pa, Page *pCopyFrom) {
 		memset(r.get_Address(), 0, Storage.PageSize);				//!!!TODO: optimize
 		break;
 	}
-	ASSERT(!r.m_pimpl->aEntries.load() && !r.m_pimpl->Overflows);
+	ASSERT(!r->aEntries.load() && !r->Overflows);
 	return r;
 }
 
 Page DbTransaction::OpenPage(uint32_t pgno) {
 	Page r = Storage.OpenPage(pgno);
 	if (!ReadOnly) {
-		bool bDirty = r.m_pimpl->Dirty = AllocatedPages.count(pgno);
+		bool bDirty = r->Dirty = AllocatedPages.count(pgno);
 		if (bDirty && Storage.ProtectPages)
-			MemoryMappedView::Protect(r.m_pimpl->GetAddress(), Storage.PageSize, MemoryMappedFileAccess::ReadWrite);
+			MemoryMappedView::Protect(r->GetAddress(), Storage.PageSize, MemoryMappedFileAccess::ReadWrite);
 	}
 	return r;
 }
@@ -1014,7 +1015,7 @@ void DbTransaction::Commit() {
 			}
 		}
 
-		
+
 		EXT_LOCK (Storage.MtxRoot) {
 			EXT_LOCK (Storage.MtxFreePages) {
 				Storage.MainTableRoot = MainTableRoot;

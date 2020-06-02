@@ -91,10 +91,10 @@ LiteEntry GetLiteEntry(const PagePos& pp, uint8_t keySize) {
 	return pd[pp.Pos];
 }
 
-size_t GetEntrySize(const pair<size_t, bool>& ppEntry, size_t ksize, uint64_t dsize) {
+size_t GetEntrySize(const EntrySize& es, size_t ksize, uint64_t dsize) {
 	uint8_t buf[10], *p = buf;
 	Write7BitEncoded(p, dsize);
-	return ppEntry.first + ksize + (p - buf) + (ppEntry.second ? 4 : 0);
+	return es.Size + ksize + (p - buf) + (es.IsBigData ? 4 : 0);
 }
 
 int Page::FillPercent(uint8_t keySize) {
@@ -133,7 +133,7 @@ uint32_t DeleteEntry(const PagePos& pp, uint8_t keySize) {
 	bool bBranch = pp.Page.IsBranch;
 	int r = DB_EOF_PGNO;
 	if (!bBranch) {
-		pair<Span, uint64_t> qq = e.LocalData(pp.Page.m_pimpl->View->Storage.PageSize, keySize, pd.Header.KeyOffset());
+		pair<Span, uint64_t> qq = e.LocalData(pp.Page->View->Storage.PageSize, keySize, pd.Header.KeyOffset());
 		if (qq.first.size() != qq.second)
 			r = e.FirstBigdataPage();
 	}
@@ -362,7 +362,7 @@ void BTreeCursor::Balance() {
 	Initialized = false;
 	Blob blobDivs(0, Tree->Tx.Storage.PageSize);										// should be in dynamic scope during one nested call of Balance()
 	Tree->BalanceNonRoot(Path[Path.size()-2], Path.back().Page, blobDivs.data());
-	Path.back().Page.m_pimpl->Overflows = 0;
+	Path.back().Page->Overflows = 0;
 	Path.pop_back();
 	Balance();
 }
@@ -377,16 +377,17 @@ void BTreeCursor::Delete() {
 int PagedMap::Compare(const void *p1, const void *p2, size_t cb2) {
 	size_t cb1 = ((const uint8_t*)p1)[-1];
 	int r = memcmp(p1, p2, std::min(cb1, cb2));
-	return r ? r
-		     : (cb1 < cb2 ? -1 : cb1==cb2 ? 0 : 1);
+	return r
+		? r
+		: (cb1 < cb2 ? -1 : cb1 == cb2 ? 0 : 1);
 }
 
-pair<size_t, bool> PagedMap::GetDataEntrySize(RCSpan k, uint64_t dsize) const {
+EntrySize PagedMap::GetDataEntrySize(RCSpan k, uint64_t dsize) const {
 	uint32_t pageSize = Tx.Storage.PageSize;
 	uint8_t buf[10], *p = buf;
 	Write7BitEncoded(p, dsize);
 	size_t cbExtendedPrefix = (KeySize ? KeySize : 1 + k.size()) + (p - buf);
-	return make_pair(CalculateLocalDataSize(dsize, cbExtendedPrefix, pageSize), cbExtendedPrefix + dsize > pageSize - 3); //!!!?
+	return EntrySize(CalculateLocalDataSize(dsize, cbExtendedPrefix, pageSize), cbExtendedPrefix + dsize > pageSize - 3); //!!!?
 }
 
 pair<int, bool> PagedMap::EntrySearch(const PageDesc& pd, RCSpan k) {
@@ -414,7 +415,7 @@ EntryDesc PagedMap::GetEntryDesc(const PagePos& pp) {
 	EntryDesc r;
 	r.P = e.P;
 	r.Size = e.Size();
-	uint32_t pageSize = pp.Page.m_pimpl->View->Storage.PageSize;
+	uint32_t pageSize = pp.Page->View->Storage.PageSize;
 	pair<Span, uint64_t> qq = e.LocalData(pageSize, KeySize, pd.Header.KeyOffset());
 	r.LocalData = qq.first;
 	r.DataSize = qq.second;
@@ -524,8 +525,7 @@ bool BTreeCursor::SeekToSibling(bool bToRight) {
 }
 
 void BTreeCursor::InsertImp(Span k, RCSpan d) {
-	pair<size_t, bool> ppEntry = Tree->GetDataEntrySize(k, d.size());
-	InsertImpHeadTail(ppEntry, k, d, d.size(), DB_EOF_PGNO);
+	InsertImpHeadTail(Tree->GetDataEntrySize(k, d.size()), k, d, d.size(), DB_EOF_PGNO);
 }
 
 void BTreeCursor::Put(Span k, RCSpan d, bool bInsert) {
@@ -572,10 +572,10 @@ void BTreeCursor::PushFront(Span k, RCSpan d) {
 			PagePos& pp = Top();
 			EntryDesc e = Tree->GetEntryDesc(pp);
 			uint32_t pageSize = Tree->Tx.Storage.PageSize;
-			pair<size_t, bool> ppEntry;
+			EntrySize ppEntry;
 			if (!e.Overflowed ||
 				e.LocalData.size() != e.DataSize % (pageSize-4) ||
-				(ppEntry = Tree->GetDataEntrySize(k, d.size() + e.DataSize)).first == 0)
+				(ppEntry = Tree->GetDataEntrySize(k, d.size() + e.DataSize)).Size == 0)
 			{
 				Blob newdata = d + get_Data();
 				FreeBigdataPages(DeleteEntry(pp, Tree->KeySize));
@@ -583,7 +583,7 @@ void BTreeCursor::PushFront(Span k, RCSpan d) {
 				return;
 			}
 			Blob head = d + e.LocalData;
-			ASSERT(ppEntry.second && ppEntry.first == head.size() % (pageSize - 4) && ppEntry.first == (d.size() + e.DataSize) % (pageSize - 4));
+			ASSERT(ppEntry.IsBigData && ppEntry.Size == head.size() % (pageSize - 4) && ppEntry.Size == (d.size() + e.DataSize) % (pageSize - 4));
 			DeleteEntry(pp, Tree->KeySize);
 			InsertImpHeadTail(ppEntry, k, head, d.size() + e.DataSize, e.PgNo);
 			return;
@@ -605,10 +605,10 @@ void static CopyPage(Page& pageFrom, Page& pageTo, uint8_t keySize) {
 	size_t size = pd[pd.Header.Num].P - (uint8_t*)&pd.Header;
 	MemcpyAligned32(pageTo.Address, pageFrom.Address, size);
 #ifdef X_DEBUG//!!!D
-	memset((uint8_t*)pageTo.Address+size, 0xFE, pageFrom.m_pimpl->Storage.PageSize-size);
+	memset((uint8_t*)pageTo.Address+size, 0xFE, pageFrom->Storage.PageSize-size);
 #endif
 
-	LiteEntry* dEntries = pageTo.m_pimpl->aEntries = (LiteEntry*)Ext::Malloc(sizeof(LiteEntry) * (pd.Header.Num + 1));
+	LiteEntry* dEntries = pageTo->aEntries = (LiteEntry*)Ext::Malloc(sizeof(LiteEntry) * (pd.Header.Num + 1));
 	ssize_t off = (uint8_t*)pageTo.get_Address() - (uint8_t*)pageFrom.get_Address();
 	for (int i = 0, n = pd.Header.Num; i <= n; ++i)
 		dEntries[i].P = pd[i].P + off;

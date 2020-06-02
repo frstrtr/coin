@@ -30,7 +30,7 @@ public:
 	DbTable m_tableDomains;
 
 	NamecoinDbliteDb()
-		:	m_tableDomains("domains", 0, TableType::HashTable)
+		: m_tableDomains("domains", 0, TableType::HashTable)
 	{
 	}
 protected:
@@ -96,12 +96,12 @@ public:
 	CBool ResolverMode;
 
 	NamecoinSqliteDb()
-		:	ResolverMode(true)
-		,	m_cmdInsertDomain("INSERT INTO domains (name, txid) VALUES (?, ?)"				, m_db)
-		,	m_cmdUpdateDomain("UPDATE domains SET txid=? WHERE name=?"						, m_db)
-		,	m_cmdFindDomain("SELECT txid FROM domains WHERE name=?"							, m_db)
-		,	m_cmdDeleteDomain("DELETE FROM domains WHERE txid=?"							, m_db)
-		,	m_cmdNameHeight("SELECT blockid FROM domains JOIN txes ON domains.txid=txes.id WHERE name=?"	, m_db)
+		: ResolverMode(true)
+		, m_cmdInsertDomain("INSERT INTO domains (name, txid) VALUES (?, ?)"				, m_db)
+		, m_cmdUpdateDomain("UPDATE domains SET txid=? WHERE name=?"						, m_db)
+		, m_cmdFindDomain("SELECT txid FROM domains WHERE name=?"							, m_db)
+		, m_cmdDeleteDomain("DELETE FROM domains WHERE txid=?"							, m_db)
+		, m_cmdNameHeight("SELECT blockid FROM domains JOIN txes ON domains.txid=txes.id WHERE name=?"	, m_db)
 	{
 		if (ResolverMode) {
 			m_cmdFindDomain.CommandText = "SELECT address, height FROM domains WHERE name=?";
@@ -281,7 +281,7 @@ DecodedTx DecodeNameTx(const Tx& tx) {
 }
 
 void NamecoinEng::OnCheck(const Tx& tx) {
-	if (tx.m_pimpl->Ver != NAMECOIN_TX_VERSION)
+	if (tx->Ver != NAMECOIN_TX_VERSION)
 		return;
 	DecodedTx dt = DecodeNameTx(tx);
 	if (dt.Args[0].Size > MAX_NAME_LENGTH)
@@ -316,7 +316,7 @@ static int GetRelativeDepth(const Tx& tx, const Tx& txPrev, int maxDepth) {
 static int64_t GetNameNetFee(const Tx& tx) {
 	int64_t r = 0;
 	EXT_FOR (const TxOut& txOut, tx.TxOuts()) {
-		if (txOut.get_ScriptPubKey().Size == 1 && txOut.get_ScriptPubKey()[0] == OP_RETURN)
+		if (txOut.get_ScriptPubKey().size() == 1 && txOut.get_ScriptPubKey()[0] == OP_RETURN)
 			r += txOut.Value;
 	}
 	return r;
@@ -349,7 +349,7 @@ void NamecoinEng::OnConnectInputs(const Tx& tx, const vector<Tx>& vTxPrev, bool 
 				}
 			}
 		}
-		if (tx.m_pimpl->Ver != NAMECOIN_TX_VERSION) {
+		if (tx->Ver != NAMECOIN_TX_VERSION) {
 			if (bFound)
 				Throw(CoinErr::NAME_NameCoinTransactionWithInvalidVersion);
 			return;
@@ -376,7 +376,7 @@ void NamecoinEng::OnConnectInputs(const Tx& tx, const vector<Tx>& vTxPrev, bool 
 				int hPrev = NamecoinDb().GetNameHeight(dt.Args[0], heightExpired);
 				if (hPrev>=0 && hPrev > heightExpired)
 					Throw(CoinErr::NAME_ExpirationError);
-				if (Mode!=EngMode::Lite && Mode!=EngMode::BlockParser) {
+				if (Mode != EngMode::Lite && Mode != EngMode::BlockParser) {
 					int depth = GetRelativeDepth(tx, vTxPrev[dtPrev.NOut], MIN_FIRSTUPDATE_DEPTH);
 					if (depth >= 0 && depth < MIN_FIRSTUPDATE_DEPTH)
 						Throw(CoinErr::NAME_ExpirationError);
@@ -420,7 +420,7 @@ void NamecoinEng::OnConnectBlock(const Block& block) {
 }
 
 void NamecoinEng::OnDisconnectInputs(const Tx& tx) {
-	if (tx.m_pimpl->Ver != NAMECOIN_TX_VERSION)
+	if (tx->Ver != NAMECOIN_TX_VERSION)
 		return;
 
 	DecodedTx dt = DecodeNameTx(tx);
@@ -466,4 +466,3 @@ INamecoinDb& NamecoinEng::NamecoinDb() {
 static CurrencyFactory<NamecoinEng> s_namecoin("Namecoin");
 
 } // Coin::
-

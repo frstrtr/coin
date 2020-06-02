@@ -21,4 +21,3 @@
 #ifdef _DEBUG//!!!T
 //#	define UCFG_COIN_USE_FUTURES 0
 #endif
-

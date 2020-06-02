@@ -39,8 +39,8 @@ public:
 	Address m_addr;
 
 	AddressCom(WalletCom& wallet, const Address& addr)
-		:	m_wallet(wallet)
-		,	m_addr(addr)
+		: m_wallet(wallet)
+		, m_addr(addr)
 	{}
 
 	~AddressCom() {
@@ -103,14 +103,14 @@ public:
 	WalletTx m_wtx;
 
 	TransactionCom(WalletCom& wallet)
-		:	m_wallet(wallet)
+		: m_wallet(wallet)
 	{}
 
 	~TransactionCom();
 
 	HRESULT __stdcall get_Timestamp(DATE *r)
 	METHOD_BEGIN {
-		*r = m_wtx.Timestamp.ToOADate();
+		*r = m_wtx.Timestamp().ToOADate();
 	} METHOD_END
 
 	HRESULT __stdcall get_Comment(BSTR *r)
@@ -198,8 +198,8 @@ public:
 	atomic<int> aStateChanged;
 
 	WalletCom(Wallet& wallet)
-		:	m_wallet(wallet)
-		,	aStateChanged(1)
+		: m_wallet(wallet)
+		, aStateChanged(1)
 	{
 		m_wallet.m_iiWalletEvents.reset(this);
 	}
@@ -222,59 +222,73 @@ public:
 		*r = ToDecimal(m_wallet.Balance);
 	} METHOD_END
 
-	HRESULT __stdcall SendTo(DECIMAL amount, BSTR addr, BSTR comment)
+	HRESULT __stdcall SendTo(DECIMAL amount, BSTR addr, BSTR comment, DECIMAL fee)
 	METHOD_BEGIN {
 		CCoinEngThreadKeeper engKeeper(&m_wallet.Eng, nullptr, true);
 		if (amount.sign || amount.Lo64==0)
 			Throw(E_INVALIDARG);
-		m_wallet.SendTo(make_decimal64(amount.Lo64, -amount.scale), addr, comment);
+		m_wallet.SendTo(make_decimal64(amount.Lo64, -amount.scale), addr, comment, make_decimal64(fee.Lo64, -fee.scale));
 	} METHOD_END
 
 	HRESULT __stdcall GenerateNewAddress(EAddressType type, BSTR comment, IAddress** r)
 	METHOD_BEGIN {
 		CCoinEngThreadKeeper engKeeper(&m_wallet.Eng);
-		CComPtr<IAddress> iA = new AddressCom(_self, m_wallet.Eng.m_cdb.GenerateNewAddress((AddressType)type, comment).ToAddress());
+		CComPtr<IAddress> iA = new AddressCom(_self, m_wallet.Eng.m_cdb.GenerateNewAddress((AddressType)type, comment)->ToAddress());
 		*r = iA.Detach();
 	} METHOD_END
 
 	HRESULT __stdcall get_Transactions(SAFEARRAY **r)		// Transactions in descending timestamp order
 	METHOD_BEGIN {
 		CCoinEngThreadKeeper engKeeper(&m_wallet.Eng);
+		CoinDb& cdb = m_wallet.Eng.m_cdb;
 		EXT_LOCK (Mtx) {
 			if (m_saTxes.vt == VT_EMPTY) {
 				vector<WalletTx> vec;
-				EXT_LOCK (m_wallet.Eng.m_cdb.MtxDb) {
-					for (DbDataReader dr = m_wallet.Eng.m_cdb.CmdGetTxes.Bind(1, m_wallet.m_dbNetId).ExecuteReader(); dr.Read();) {
+				EXT_LOCK (cdb.MtxDb) {
+					for (DbDataReader dr = cdb.CmdGetTxes.Bind(1, m_wallet.m_dbNetId).ExecuteReader(); dr.Read();) {
 						WalletTx wtx;
 						wtx.LoadFromDb(dr, true);
 						auto& to = wtx.To;
 						switch (to.Type) {
 						case AddressType::P2PKH:
-							if (!m_wallet.Eng.m_cdb.Hash160ToKey.count((HashValue160)to))
+							if (!cdb.Hash160ToKey.count((HashValue160)to))
 								wtx.Amount = -wtx.Amount;
 							break;
 						case AddressType::P2SH:
-							if (!m_wallet.Eng.m_cdb.P2SHToKey.count((HashValue160)to))
+							if (!cdb.P2SHToKey.count((HashValue160)to))
 								wtx.Amount = -wtx.Amount;
 							break;
 						case AddressType::Bech32:
 							switch (to.Data().size()) {
 							case 20:
-								if (!m_wallet.Eng.m_cdb.Hash160ToKey.count((HashValue160)to))
+								if (!cdb.Hash160ToKey.count((HashValue160)to))
 									wtx.Amount = -wtx.Amount;
 								break;
 							case 32:
-								if (!m_wallet.Eng.m_cdb.P2SHToKey.count(Hash160(((HashValue)to).ToSpan())))	//!!!?
+								if (!cdb.P2SHToKey.count(Hash160(((HashValue)to).ToSpan())))	//!!!?
 									wtx.Amount = -wtx.Amount;
 								break;
 							}
+							break;
+						case AddressType::WitnessV0KeyHash:
+							if (!cdb.Hash160ToKey.count((HashValue160)to))
+								wtx.Amount = -wtx.Amount;
+							break;
+						case AddressType::WitnessV0ScriptHash:
+							{
+								MemoryStream ms;
+								ScriptWriter(ms) << Opcode::OP_RETURN << to.Data();
+								HashValue160 hash160 = Hash160(ms);
+								if (!cdb.P2SHToKey.count(Hash160(hash160)))	//!!!?
+									wtx.Amount = -wtx.Amount;
+							}
+							break;
 						}
-
 						vec.push_back(wtx);
 					}
 				}
 				m_saTxes.CreateOneDim(VT_DISPATCH, vec.size());
-				for (long idx=0; idx<vec.size(); ++idx) {
+				for (long idx = 0; idx < vec.size(); ++idx) {
 					WalletTx& wtx = vec[idx];
 					CComPtr<ITransaction> iTx;
 					if (optional<CComPtr<ITransaction>> oiTx = Lookup(m_keyToTxCom, wtx.UniqueKey()))
@@ -313,10 +327,13 @@ public:
 		CCoinEngThreadKeeper engKeeper(&m_wallet.Eng);
 
 		COleSafeArray sa;
-		vector<Address> ar = m_wallet.MyAddresses;
-		sa.CreateOneDim(VT_DISPATCH, ar.size());
-		for (long i = 0; i < ar.size(); ++i)
-			sa.PutElement(&i, GetAddressByString(ar[i]).Detach());
+		unordered_set<Address> addresses = m_wallet.MyAddresses;
+		sa.CreateOneDim(VT_DISPATCH, addresses.size());
+		long i = 0;
+		for (auto& a : addresses) {
+			sa.PutElement(&i, GetAddressByString(a).Detach());
+			++i;
+		}
 		*r = sa.Detach().parray;
 	} METHOD_END
 
@@ -429,12 +446,12 @@ public:
 					}
 					break;
 				}
-				if (ptr<CompactThread> t = m_wallet.CompactThread) {
-					os << "Compacting Database  " << int64_t(t->m_ai)*100/t->m_count << "%";
+				if (ptr<CompactThread> t = m_wallet.ThreadCompact) {
+					os << "Compacting Database  " << int64_t(t->m_ai) * 100 / t->m_count << "%";
 					break;
 				}
 
-				if (Block bestBlock = m_wallet.Eng.BestBlock()) {
+				if (BlockHeader bestBlock = m_wallet.Eng.BestBlock()) {
 					BlockHeader bestHeader = m_wallet.Eng.BestHeader();
 					os.imbue(s_localeCommaSeparated);
 					if (bestBlock.Height < bestHeader.Height)
@@ -453,11 +470,13 @@ public:
 						os << bestBlock.Timestamp.ToLocalTime();
 				}
 
-				if (ptr<RescanThread> rt = m_wallet.RescanThread) {
+				if (ptr<RescanThread> rt = m_wallet.ThreadRescan) {
 					os << ", Rescanning block " << m_wallet.CurrentHeight;
 				}
 				if (m_wallet.MiningEnabled) {
-					os << ", Mining " << setprecision(3) << fixed << m_wallet.Speed/1000000 << " MH/s";
+					char sNum[30];
+					sprintf(sNum, ", Mining %3.1f MH/s", m_wallet.Speed / 1000000);
+					os << sNum;
 				}
 			} while (false);
 		}
@@ -534,16 +553,16 @@ public:
 		uint8_t ver = blob.constData()[0];
 		if (ver == 0x80) {
 			KeyInfo ki;
-			ki.m_pimpl->SetPrivData(Span(blob.constData() + 1, 32), blob.size() == 34);
-			ki.Comment = "Imported";
+			ki->SetPrivData(PrivateKey(Span(blob.constData() + 1, 32), blob.size() == 34));
+			ki->Comment = "Imported";
 			EXT_LOCK(eng.m_cdb.MtxDb) {
 				if (!eng.m_cdb.Hash160ToKey.count(ki.PubKey.Hash160))
 					eng.m_cdb.AddNewKey(ki);
 			}
-		} else if (ver==1 && blob.constData()[1] == 0x42) {
+		} else if (ver == 1 && blob.constData()[1] == 0x42) {
 			KeyInfo ki;
-			ki.m_pimpl->FromBIP38(ssKey, password);
-			ki.Comment = "Imported";
+			ki->FromBIP38(ssKey, password);
+			ki->Comment = "Imported";
 			EXT_LOCK(eng.m_cdb.MtxDb) {
 				if (!eng.m_cdb.Hash160ToKey.count(ki.PubKey.Hash160))
 					eng.m_cdb.AddNewKey(ki);
@@ -638,11 +657,11 @@ public:
 };
 
 WalletAndEng::WalletAndEng(CoinDb& cdb, RCString name)
-	:	base(cdb, name)
-	,	m_iWallet(static_cast<IWallet*>(new WalletCom(_self)))
+	: base(cdb, name)
+	, m_iWallet(static_cast<IWallet*>(new WalletCom(_self)))
 {
 	EXT_LOCK (cdb.MtxDb) {
-		SqliteCommand cmd("SELECT * FROM nets WHERE name=?", cdb.m_dbWallet);
+		SqliteCommand cmd("SELECT * FROM nets WHERE name=? COLLATE NOCASE", cdb.m_dbWallet);
 		cmd.Bind(1, name);
 		if (!cmd.ExecuteReader().Read()) {
 			SqliteCommand("INSERT INTO nets (name) VALUES(?)", cdb.m_dbWallet)
@@ -656,7 +675,7 @@ WalletAndEng::~WalletAndEng() {
 }
 
 class CoinEngCom : public IDispatchImpl<CoinEngCom, ICoinEng>
-	,	public ISupportErrorInfoImpl<ICoinEng>
+	, public ISupportErrorInfoImpl<ICoinEng>
 {
 public:
 	DECLARE_STANDARD_UNKNOWN()
@@ -685,10 +704,10 @@ public:
 	METHOD_BEGIN {
 		TRC(1, "");
 
-		for (int i=0; i<m_vWalletEng.size(); ++i)
+		for (int i = 0; i < m_vWalletEng.size(); ++i)
 			m_vWalletEng[i]->m_peng->SignalStop();
 
-		for (int i=0; i<m_vWalletEng.size(); ++i) {
+		for (int i = 0; i < m_vWalletEng.size(); ++i) {
 			m_vWalletEng[i]->m_peng->Stop();
 			m_vWalletEng[i]->Close();
 		}
@@ -781,6 +800,16 @@ public:
 		if (m_cdb.ProxyString.ToUpper() == "TOR")
 			m_cdb.ListeningPort = uint16_t(-1);
 	} METHOD_END
+
+	HRESULT __stdcall get_Testnet(VARIANT_BOOL* r)
+	METHOD_BEGIN {
+		*r = g_conf.Testnet;
+	} METHOD_END
+
+	HRESULT __stdcall put_Testnet(VARIANT_BOOL r)
+	METHOD_BEGIN {
+		g_conf.Testnet = r;
+	} METHOD_END
 };
 
 TransactionCom::~TransactionCom() {
@@ -810,9 +839,9 @@ METHOD_BEGIN {
 HRESULT TransactionCom::get_Confirmations(int *r)
 METHOD_BEGIN {
 	*r = 0;
-	Block bestBlock = m_wallet.m_wallet.Eng.BestBlock();
+	BlockHeader bestBlock = m_wallet.m_wallet.Eng.BestBlock();
 	if (m_wtx.Height >= 0 && bestBlock)
-		*r = bestBlock.Height - m_wtx.Height+1;
+		*r = bestBlock.Height - m_wtx.Height + 1;
 } METHOD_END
 
 HRESULT TransactionCom::put_Comment(BSTR s)

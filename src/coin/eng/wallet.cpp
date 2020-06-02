@@ -5,16 +5,8 @@
 
 #include <el/ext.h>
 
-
 #include "wallet.h"
 #include "script.h"
-
-#ifdef C_DEBUG//!!!D
-#	include <el/xml.h>
-	namespace Coin {
-#		include "../blockexplorer/xml-write.cpp"
-	}
-#endif
 
 namespace Coin {
 
@@ -54,16 +46,20 @@ void Wallet::Init() {
 WalletTx::WalletTx(const Tx& tx)
 	: base(tx)
 	, To(Eng())
-	, Timestamp(Clock::now())
-{}
+{
+}
+
+DateTime WalletTx::Timestamp() const {
+	return m_pimpl->Timestamp ? m_pimpl->Timestamp.value() : Clock::now();
+}
 
 void WalletTx::LoadFromDb(DbDataReader& sr, bool bLoadExt) {
-	Timestamp = DateTime::from_time_t(sr.GetInt32(0));
 	CMemReadStream stm(sr.GetBytes(1));
 	Coin::DbReader rd(stm, &Eng());
 	rd.BlockchainDb = false;
 	rd >> _self;
-	Height = sr.GetInt32(2);
+	m_pimpl->Timestamp = DateTime::from_time_t(sr.GetInt32(0));
+	m_pimpl->Height = sr.GetInt32(2);
 	Comment = sr.GetString(3);
 	m_bFromMe = sr.GetInt32(4);
 
@@ -76,14 +72,14 @@ void WalletTx::LoadFromDb(DbDataReader& sr, bool bLoadExt) {
 }
 
 bool WalletTx::IsConfirmed(Wallet& wallet) const {
-	if (!IsFinal())
+	if (!m_pimpl->IsFinal())
 		return false;
 	if (DepthInMainChain >= 1)
 		return true;
 	if (!m_bFromMe && !wallet.IsFromMe(_self))
 		return false;
 	EXT_FOR (const Tx& tx, PrevTxes) {
-		if (!tx.IsFinal())
+		if (!tx->IsFinal())
 			return false;
 		if (tx.DepthInMainChain < 1) {
 			if (!wallet.IsFromMe(tx))
@@ -96,7 +92,9 @@ bool WalletTx::IsConfirmed(Wallet& wallet) const {
 String WalletTx::GetComment() const {
 	String s = m_pimpl->GetComment();
 	String r = s.empty() ? String() : s;
-	return Comment.empty() ? r : r + ". " + Comment;
+	return Comment.empty() ? r
+		: r.empty() ? Comment
+		: r + ". " + Comment;
 }
 
 int64_t Penny::get_Debit() const {
@@ -119,7 +117,6 @@ KeyInfo WalletSigner::GetMyKeyInfoByScriptHash(const HashValue160& hash160) {
 Blob WalletSigner::GetMyRedeemScript(const HashValue160& hash160) {
 	return m_wallet.m_eng->m_cdb.GetMyRedeemScript(hash160);
 }
-
 
 bool Wallet::IsToMe(const Tx& tx) {
 	CoinDb& cdb = m_eng->m_cdb;
@@ -159,12 +156,18 @@ int64_t Wallet::Add(WalletTx& wtx, bool bPending) {
 	EXT_LOCKED(m_mtxMyTxHashes, m_myTxHashes.insert(hashTx));
 	int64_t r = GetTxId(hashTx);
 	if (r != -1) {
-		SqliteCommand cmd(EXT_STR("UPDATE mytxes SET blockord=? WHERE id=" << r), m_eng->m_cdb.m_dbWallet);
-		cmd.Bind(1, wtx.Height >= 0 ? wtx.Height : (bPending ? -1 : -2));
-		cmd.ExecuteNonQuery();
+		if (wtx.Height >= 0) {
+			SqliteCommand cmd(EXT_STR("UPDATE mytxes SET blockord=?, timestamp=? WHERE id=" << r), m_eng->m_cdb.m_dbWallet);
+			cmd.Bind(1, wtx.Height)
+				.Bind(2, to_time_t(wtx.Timestamp()));
+			cmd.ExecuteNonQuery();
+		} else {
+			SqliteCommand cmd(EXT_STR("UPDATE mytxes SET blockord=? WHERE id=" << r), m_eng->m_cdb.m_dbWallet);
+			cmd.Bind(1, bPending ? -1 : -2);
+			cmd.ExecuteNonQuery();
+		}
 	} else {
-		wtx.Timestamp = wtx.Height >= 0 ? m_eng->GetBlockByHeight(wtx.Height).Timestamp : Clock::now();
-		if (wtx.IsCoinBase() && wtx.Comment.empty())
+		if (wtx->IsCoinBase() && wtx.Comment.empty())
 			wtx.Comment = "Mined";
 		MemoryStream ms;
 		DbWriter wr(ms);
@@ -174,7 +177,7 @@ int64_t Wallet::Add(WalletTx& wtx, bool bPending) {
 			.Bind(1, m_dbNetId)
 			.Bind(2, hashTx.ToSpan())
 			.Bind(3, ms)
-			.Bind(4, to_time_t(wtx.Timestamp))
+			.Bind(4, to_time_t(wtx.Timestamp()))
 			.Bind(5, wtx.Height >= 0 ? wtx.Height : (bPending ? -1 : -2))
 			.Bind(6, wtx.Comment)
 			.Bind(7, bool(wtx.m_bFromMe))
@@ -185,7 +188,10 @@ int64_t Wallet::Add(WalletTx& wtx, bool bPending) {
 }
 
 bool Wallet::InsertUserTx(int64_t txid, int nout, int64_t value) {
-	if (SqliteCommand("SELECT * FROM usertxes WHERE txid=? AND nout=?", m_eng->m_cdb.m_dbWallet).Bind(1, txid).Bind(2, nout).ExecuteReader().Read())
+	if (SqliteCommand("SELECT * FROM usertxes WHERE txid=? AND nout=?", m_eng->m_cdb.m_dbWallet)
+			.Bind(1, txid)
+			.Bind(2, nout)
+			.ExecuteReader().Read())
 		return false;
 	SqliteCommand cmd("INSERT INTO usertxes (txid, nout, value) VALUES(?, ?, ?)", m_eng->m_cdb.m_dbWallet);
 	if (nout < 0)
@@ -209,9 +215,10 @@ void Wallet::ProcessMyTx(WalletTx& wtx, bool bPending) {
 		bool bIsFromMe = IsFromMe(wtx),
 			bIsToMe = IsToMe(wtx);
 		TRC(2, txHash << boolalpha << ", IsFromMe: " << bIsFromMe << ", IsToMe: " << bIsToMe);
+		const auto& txOuts = wtx.TxOuts();
 		if (bIsFromMe) {
-//!!!?			SqliteCommand cmdCoin("UPDATE coins SET spent=1 WHERE txid=? AND nout=?", m_eng->m_cdb.m_dbWallet);
-			SqliteCommand cmdCoin("DELETE FROM coins WHERE txid=? AND nout=?", m_eng->m_cdb.m_dbWallet);
+//!!!?			SqliteCommand cmdCoin("UPDATE coins SET spent=1 WHERE txid=? AND nout=?", cdb.m_dbWallet);
+			SqliteCommand cmdCoin("DELETE FROM coins WHERE txid=? AND nout=?", cdb.m_dbWallet);
 			EXT_FOR (const TxIn& txIn, wtx.TxIns()) {
 				cmdCoin
 					.Bind(1, GetTxId(txIn.PrevOutPoint.TxHash))
@@ -219,8 +226,8 @@ void Wallet::ProcessMyTx(WalletTx& wtx, bool bPending) {
 					.ExecuteNonQuery();
 			}
 			HashValue160 hash160;
-			for (int i = 0; i < wtx.TxOuts().size(); ++i) {
-				const TxOut& txOut = wtx.TxOuts()[i];
+			for (int i = 0; i < txOuts.size(); ++i) {
+				const TxOut& txOut = txOuts[i];
 				Span scriptPubKey = txOut.get_ScriptPubKey();
 				if (!cdb.FindMine(scriptPubKey)) {
 					Address dest = TxOut::CheckStandardType(scriptPubKey);
@@ -237,15 +244,15 @@ void Wallet::ProcessMyTx(WalletTx& wtx, bool bPending) {
 //			;
 		}
 		if (bIsToMe) {
-			for (int i = 0; i < wtx.TxOuts().size(); ++i) {
-				const TxOut& txOut = wtx.TxOuts()[i];
+			for (int i = 0; i < txOuts.size(); ++i) {
+				const TxOut& txOut = txOuts[i];
 				if (KeyInfo ki = cdb.FindMine(txOut.get_ScriptPubKey())) {
-					if (!m_eng->m_cdb.CmdFindCoin.Bind(1, txid).Bind(2, i).ExecuteReader().Read()) {
-						m_eng->m_cdb.CmdInsertCoin
+					if (!cdb.CmdFindCoin.Bind(1, txid).Bind(2, i).ExecuteReader().Read()) {
+						cdb.CmdInsertCoin
 							.Bind(1, txid)
 							.Bind(2, i)
 							.Bind(3, txOut.Value)
-							.Bind(4, ki.KeyRowId)
+							.Bind(4, ki->KeyRowId)
 							.Bind(5, txOut.get_ScriptPubKey())
 							.ExecuteNonQuery();
 
@@ -267,7 +274,7 @@ bool Wallet::ProcessTx(const Tx& tx) {
 }
 
 void Wallet::OnProcessTx(const Tx& tx) {
-	if (!RescanThread)
+	if (!ThreadRescan)
 		ProcessTx(tx);
 }
 
@@ -287,7 +294,7 @@ void Wallet::OnAlert(Alert *alert) {
 		m_iiWalletEvents->OnStateChanged();
 }
 
-void Wallet::OnProcessBlock(const Block& block) {
+void Wallet::OnProcessBlock(const BlockHeader& block) {
 	if (m_iiWalletEvents)
 		m_iiWalletEvents->OnStateChanged();
 }
@@ -305,11 +312,10 @@ void Wallet::ProcessPendingTxes() {
 }
 
 void Wallet::OnBlockchainChanged() {
-	for (int i = 0; i < 2; ++i) {
+	for (int i = 0; i < 1; ++i) {		//!!!!?  Why there was `i < 2`
 		if (Thread::CurrentThread->m_bStop)
 			return;
-		bool bChanged = false;
-		Block bestBlock = m_eng->BestBlock();
+		BlockHeader bestBlock = m_eng->BestBlock();
 		EXT_LOCK(MtxCurrentHeight) {
 			if (CurrentHeight >= bestBlock.SafeHeight)
 				break;
@@ -325,17 +331,15 @@ void Wallet::OnBlockchainChanged() {
 		HashValue hash = Hash(block);
 		EXT_LOCK(MtxCurrentHeight) {
 			EXT_LOCK(m_eng->m_cdb.MtxDb) {
-				bool bUpdateWallet = m_eng->Mode == EngMode::Lite;
-				if (bUpdateWallet) {
-					EXT_FOR(const Tx & tx, block.get_Txes()) {
-						bUpdateWallet |= ProcessTx(tx);
-					}
-				}
-				++CurrentHeight;
+				bool bUpdateWallet = false;
+				for (auto& tx : block.get_Txes())
+					bUpdateWallet |= ProcessTx(tx);
+				CurrentHeight = block.Height;
 				BestBlockHash = hash;
-				if (bUpdateWallet || !(CurrentHeight & 0xFF) || (CurrentHeight == bestBlock.Height && !m_eng->IsInitialBlockDownload()))
-					SetBestBlockHash(hash);
-				bChanged = true;
+				if (bUpdateWallet
+						|| !(CurrentHeight & 0xFF)
+						|| (CurrentHeight == bestBlock.Height && !m_eng->IsInitialBlockDownload()))
+					SetBestBlockHash(hash);			// Updating on every block is expensive during 'Rescan' operation
 			}
 		}
 	}
@@ -397,7 +401,7 @@ void CompactThread::Execute() {
 
 			~ThreadPointerCleaner() {
 				m_pWallet->m_eng->Db->SetProgressHandler(0);
-				m_pWallet->CompactThread = nullptr;
+				m_pWallet->ThreadCompact = nullptr;
 				if (m_pWallet->m_iiWalletEvents)
 					m_pWallet->m_iiWalletEvents->OnStateChanged();
 			}
@@ -417,10 +421,10 @@ void CompactThread::Execute() {
 }
 
 RescanThread::RescanThread(Coin::Wallet& wallet, const HashValue& hashFrom)
-	:	base(&wallet.m_eng->m_tr)
-	,	Wallet(wallet)
-	,	m_i(0)
-	,	m_hashFrom(hashFrom)
+	: base(&wallet.m_eng->m_tr)
+	, Wallet(wallet)
+	, m_i(0)
+	, m_hashFrom(hashFrom)
 {
 }
 
@@ -433,31 +437,33 @@ void RescanThread::Execute() {
 		DbDataReader *m_pDataReader;
 
 		~ThreadPointerCleaner() {
-			m_pWallet->RescanThread = nullptr;
+			m_pWallet->ThreadRescan = nullptr;
 		}
 	} threadPointerCleaner = { &Wallet }; //!!!R, &cmdRescan, &dr };
-	CCoinEngThreadKeeper engKeeper(Wallet.m_eng);
+	CoinEng& eng = *Wallet.m_eng;
+	CCoinEngThreadKeeper engKeeper(&eng);
+	CBoolKeeper keppRescanning(eng.Rescanning, true);
 
 	int ord = 0;
-	m_count = Wallet.m_eng->Db->GetMaxHeight()+1;
-	if (Block block = Wallet.m_eng->Db->FindBlock(m_hashFrom))
-		m_count -= (ord = block.Height+1);
+	m_count = eng.Db->GetMaxHeight() + 1;
+	if (Block block = eng.Db->FindBlock(m_hashFrom))
+		m_count -= (ord = block.Height + 1);
 	Wallet.OnSetProgress(0);
 
 CONTINUE_SCAN_LAB:
-	while (Wallet.CurrentHeight < Wallet.m_eng->BestBlockHeight()) {
+	while (Wallet.CurrentHeight < eng.BestBlockHeight()) {
 		if (m_bStop)
 			goto LAB_STOP;
 		Wallet.OnBlockchainChanged();
 //!!!		Wallet.OnSetProgress(float(m_i) / m_count);
 	}
-	if (Block bestBlock = Wallet.m_eng->BestBlock()) {
+	if (BlockHeader bestBlock = eng.BestBlock()) {
 		HashValue hashBest = Hash(bestBlock);
 		if (hashBest == Wallet.BestBlockHash) {
 			Wallet.ProcessPendingTxes();
 		} else {
-			ord = int(ord+m_i);
-			m_count = Wallet.m_eng->BestBlockHeight() - ord + 1;
+			ord = int(ord + m_i);
+			m_count = eng.BestBlockHeight() - ord + 1;
 			goto CONTINUE_SCAN_LAB;
 		}
 	}
@@ -466,32 +472,34 @@ LAB_STOP:
 }
 
 void Wallet::StartRescan(const HashValue& hashFrom) {
-	(RescanThread = new Coin::RescanThread(_self, hashFrom))->Start();
+	(ThreadRescan = new RescanThread(_self, hashFrom))->Start();
 }
 
 void Wallet::StartCompactDatabase() {
-	if (!CompactThread)
-		(CompactThread = new Coin::CompactThread(_self))->Start();
+	if (!ThreadCompact)
+		(ThreadCompact = new CompactThread(_self))->Start();
 }
 
 void Wallet::Rescan() {
-	if (RescanThread)
+	if (ThreadRescan)
 		return;
 
 	if (m_eng->Mode == EngMode::Lite) {
-		m_eng->PurgeDatabase();
-	} else if (m_eng->IsInitialBlockDownload())
+		// m_eng->PurgeDatabase();
+	}
+	if (m_eng->IsInitialBlockDownload())
 		Throw(CoinErr::RescanIsDisabledDuringInitialDownload);
 
+	CoinDb& cdb = m_eng->m_cdb;
 	EXT_LOCK (Mtx) {
-		EXT_LOCK (m_eng->m_cdb.MtxDb) {
-			TransactionScope dbtx(m_eng->m_cdb.m_dbWallet);
+		EXT_LOCK (cdb.MtxDb) {
+			TransactionScope dbtx(cdb.m_dbWallet);
 
-			SqliteCommand(EXT_STR("DELETE FROM coins WHERE txid IN (SELECT id FROM mytxes WHERE netid=" << m_dbNetId << ")"), m_eng->m_cdb.m_dbWallet).ExecuteNonQuery();
-			SqliteCommand(EXT_STR("DELETE FROM usertxes WHERE txid IN (SELECT id FROM mytxes WHERE netid=" << m_dbNetId << ")"), m_eng->m_cdb.m_dbWallet).ExecuteNonQuery();
-			SqliteCommand(EXT_STR("UPDATE mytxes SET blockord=-1 WHERE blockord>-15 AND netid=" << m_dbNetId), m_eng->m_cdb.m_dbWallet).ExecuteNonQuery();
+			SqliteCommand(EXT_STR("DELETE FROM coins WHERE txid IN (SELECT id FROM mytxes WHERE netid=" << m_dbNetId << ")"), cdb.m_dbWallet).ExecuteNonQuery();
+			SqliteCommand(EXT_STR("DELETE FROM usertxes WHERE txid IN (SELECT id FROM mytxes WHERE netid=" << m_dbNetId << ")"), cdb.m_dbWallet).ExecuteNonQuery();
+			SqliteCommand(EXT_STR("UPDATE mytxes SET blockord=-1 WHERE blockord>-15 AND netid=" << m_dbNetId), cdb.m_dbWallet).ExecuteNonQuery();
 
-			SqliteCommand(EXT_STR("UPDATE nets SET bestblockhash=? WHERE netid=" << m_dbNetId), m_eng->m_cdb.m_dbWallet)
+			SqliteCommand(EXT_STR("UPDATE nets SET bestblockhash=? WHERE netid=" << m_dbNetId), cdb.m_dbWallet)
 				.Bind(1, HashValue::Null().ToSpan())
 				.ExecuteNonQuery();
 			CurrentHeight = -1;
@@ -502,19 +510,20 @@ void Wallet::Rescan() {
 }
 
 void Wallet::CancelPendingTxes() {
-	EXT_LOCK (m_eng->m_cdb.MtxDb) {
-		TransactionScope dbtx(m_eng->m_cdb.m_dbWallet);
-		SqliteCommand(EXT_STR("UPDATE mytxes SET blockord=-15 WHERE blockord<0 AND blockord>-15 AND netid=" << m_dbNetId), m_eng->m_cdb.m_dbWallet).ExecuteNonQuery();
-		SqliteCommand("DELETE FROM coins WHERE txid IN (SELECT id FROM mytxes WHERE blockord=-15)", m_eng->m_cdb.m_dbWallet).ExecuteNonQuery();
-		SqliteCommand("DELETE FROM usertxes WHERE txid IN (SELECT id FROM mytxes WHERE blockord=-15)", m_eng->m_cdb.m_dbWallet).ExecuteNonQuery();
+	CoinDb& cdb = m_eng->m_cdb;
+	EXT_LOCK (cdb.MtxDb) {
+		TransactionScope dbtx(cdb.m_dbWallet);
+		SqliteCommand(EXT_STR("UPDATE mytxes SET blockord=-15 WHERE blockord<0 AND blockord>-15 AND netid=" << m_dbNetId), cdb.m_dbWallet).ExecuteNonQuery();
+		SqliteCommand("DELETE FROM coins WHERE txid IN (SELECT id FROM mytxes WHERE blockord=-15)", cdb.m_dbWallet).ExecuteNonQuery();
+		SqliteCommand("DELETE FROM usertxes WHERE txid IN (SELECT id FROM mytxes WHERE blockord=-15)", cdb.m_dbWallet).ExecuteNonQuery();
 	}
 	Rescan();
 
 	/*!!!
 	EXT_LOCK (m_eng->Mtx) {
-		EXT_LOCK (m_eng->m_cdb.MtxDb) {
+		EXT_LOCK (cdb.MtxDb) {
 			vector<int64_t> txesToDelete;
-			SqliteCommand cmdTx(EXT_STR("SELECT timestamp, data, blockord, comment, fromme, id FROM mytxes WHERE blockord<0 AND blockord>-15 AND netid=" << m_dbNetId << " ORDER BY timestamp"), m_eng->m_cdb.m_dbWallet);
+			SqliteCommand cmdTx(EXT_STR("SELECT timestamp, data, blockord, comment, fromme, id FROM mytxes WHERE blockord<0 AND blockord>-15 AND netid=" << m_dbNetId << " ORDER BY timestamp"), cdb.m_dbWallet);
 			for (DbDataReader dr=cmdTx.ExecuteReader(); dr.Read();) {
 				try {
 					WalletTx wtx;
@@ -528,12 +537,12 @@ void Wallet::CancelPendingTxes() {
 				}
 			}
 			if (!txesToDelete.empty()) {
-				TransactionScope dbtx(m_eng->m_cdb.m_dbWallet);
+				TransactionScope dbtx(cdb.m_dbWallet);
 
 				EXT_FOR (int64_t txid, txesToDelete) {
-					SqliteCommand(EXT_STR("UPDATE mytxes SET blockord=-15 WHERE id=" << txid), m_eng->m_cdb.m_dbWallet).ExecuteNonQuery();
-					SqliteCommand(EXT_STR("DELETE FROM coins WHERE txid=" << txid), m_eng->m_cdb.m_dbWallet).ExecuteNonQuery();
-					SqliteCommand(EXT_STR("DELETE FROM usertxes WHERE txid=" << txid), m_eng->m_cdb.m_dbWallet).ExecuteNonQuery();
+					SqliteCommand(EXT_STR("UPDATE mytxes SET blockord=-15 WHERE id=" << txid), cdb.m_dbWallet).ExecuteNonQuery();
+					SqliteCommand(EXT_STR("DELETE FROM coins WHERE txid=" << txid), cdb.m_dbWallet).ExecuteNonQuery();
+					SqliteCommand(EXT_STR("DELETE FROM usertxes WHERE txid=" << txid), cdb.m_dbWallet).ExecuteNonQuery();
 				}
 			}
 		}
@@ -549,9 +558,9 @@ void Wallet::ReacceptWalletTxes() {
 
 		DBG_LOCAL_IGNORE_CONDITION(CoinErr::TxNotFound);
 		try {
-			if (!wtx.IsCoinBase()) {
+			if (!wtx->IsCoinBase()) {
 				EXT_FOR (const Tx& txPrev, wtx.PrevTxes) {
-					if (!txPrev.IsCoinBase())
+					if (!txPrev->IsCoinBase())
 						m_eng->TxPool.AddToPool(txPrev, vQueue);
 				}
 				m_eng->TxPool.AddToPool(wtx, vQueue);
@@ -563,29 +572,30 @@ void Wallet::ReacceptWalletTxes() {
 
 void Wallet::SetNextResendTime(const DateTime& dt) {
 	m_dtNextResend = dt + seconds(Ext::Random().Next(SECONDS_RESEND_PERIODICITY));
-	TRC(2, "next resend at " << m_dtNextResend.ToLocalTime());
-#ifdef X_DEBUG//!!!D
-	m_dtNextResend = dt + seconds(3);
+#ifdef _DEBUG//!!!D
+	m_dtNextResend = dt + seconds(10);
 #endif
+	TRC(2, "next resend at " << m_dtNextResend.ToLocalTime());
 }
 
 void Wallet::Start() {
 	if (m_bLoaded)
 		return;
-	CCoinEngThreadKeeper engKeeper(m_eng);
+	CoinDb& cdb = m_eng->m_cdb;
+	CCoinEngThreadKeeper engKeeper(m_eng, nullptr, true);
 	m_eng->Load();
 
 	bool bIsInitialBlockDownload = m_eng->IsInitialBlockDownload();
-	EXT_LOCK (m_eng->m_cdb.MtxDb) {
+	EXT_LOCK (cdb.MtxDb) {
 		{
-			SqliteCommand cmd("SELECT netid, bestblockhash FROM nets WHERE name=?", m_eng->m_cdb.m_dbWallet);
+			SqliteCommand cmd("SELECT netid, bestblockhash FROM nets WHERE name=? COLLATE NOCASE", cdb.m_dbWallet);
 			DbDataReader dr = cmd.Bind(1, m_eng->ChainParams.Name).ExecuteVector();
 			m_dbNetId = dr.GetInt32(0);
 			Span mb = dr.GetBytes(1);
 			BestBlockHash = mb.size() ? HashValue(mb) : HashValue::Null();
 		}
 		EXT_LOCK(m_mtxMyTxHashes) {
-			SqliteCommand cmd("SELECT hash FROM mytxes", m_eng->m_cdb.m_dbWallet);
+			SqliteCommand cmd("SELECT hash FROM mytxes", cdb.m_dbWallet);
 			for (DbDataReader dr = cmd.ExecuteReader(); dr.Read();)
 				m_myTxHashes.insert(HashValue(dr.GetBytes(0)));
 		}
@@ -593,24 +603,20 @@ void Wallet::Start() {
 	if (Block block = m_eng->Db->FindBlock(BestBlockHash))
 		CurrentHeight = block.Height;
 
-#ifdef X_DEBUG//!!!D
-	auto fee = CalcFee(decimal64(0.0003615));
-	String sFee = EXT_STR(fee);
-#endif
-
-	EXT_LOCK (m_eng->m_cdb.MtxDb) {
-		if (m_eng->Mode != EngMode::Lite) {
-			if (!bIsInitialBlockDownload)
-				ReacceptWalletTxes();												//!!!TODO
-
-			if (!RescanThread) {
-				if (CurrentHeight >= 0 && CurrentHeight < m_eng->BestBlockHeight() || BestBlockHash == HashValue::Null())
-					StartRescan(BestBlockHash);
-			}
-		}
+	EXT_LOCK (cdb.MtxDb) {
+		if (!bIsInitialBlockDownload && m_eng->Mode != EngMode::Lite)
+			ReacceptWalletTxes();												//!!!TODO
 	}
 
 	m_eng->Start();
+
+	EXT_LOCK(cdb.MtxDb) {
+		if (!ThreadRescan) {
+			if (CurrentHeight >= 0 && CurrentHeight < m_eng->BestBlockHeight() || BestBlockHash == HashValue::Null())
+				StartRescan(BestBlockHash);
+		}
+	}
+
 	SetNextResendTime(Clock::now());
 	m_bLoaded = true;
 }
@@ -628,12 +634,15 @@ void Wallet::Close() {
 	Stop();
 }
 
-vector<Address> Wallet::get_MyAddresses() {
-	vector<Address> r;
+unordered_set<Address> Wallet::get_MyAddresses() {
+	unordered_set<Address> r;
 	EXT_LOCK (m_eng->m_cdb.MtxDb) {
-		for (CoinDb::CHash160ToKey::iterator it = m_eng->m_cdb.Hash160ToKey.begin(), e = m_eng->m_cdb.Hash160ToKey.end(); it != e; ++it)
-			if (it->second.Comment != nullptr)
-				r.push_back(it->second.ToAddress());
+		for (auto& kv : m_eng->m_cdb.Hash160ToKey)
+			if (kv.second->Comment != nullptr)
+				r.insert(kv.second->ToAddress());
+		for (auto& kv : m_eng->m_cdb.P2SHToKey)
+			if (kv.second->Comment != nullptr)
+				r.insert(kv.second->ToAddress());
 	}
 	return r;
 }
@@ -643,26 +652,36 @@ vector<Address> Wallet::get_Recipients() {
 
 	vector<Address> r;
 	EXT_LOCK (m_eng->m_cdb.MtxDb) {
-		for (DbDataReader dr = m_eng->m_cdb.CmdRecipients.Bind(1, m_dbNetId).ExecuteReader(); dr.Read();)
-			r.push_back(Address(*m_eng, AddressType(dr.GetInt32(0)), HashValue160(dr.GetBytes(1)), 0, dr.GetString(2))); //!!!?
+		for (DbDataReader dr = m_eng->m_cdb.CmdRecipients.Bind(1, m_dbNetId).ExecuteReader(); dr.Read();) {
+			auto typ = AddressType(dr.GetInt32(0));
+			Span data = dr.GetBytes(1);
+			Address a = typ == AddressType::Bech32
+				? TxOut::CheckStandardType(data)
+				: Address(*m_eng, typ, HashValue160(data));
+			a->Type = typ;			// override for Bech32
+			a->Comment = dr.GetString(2);
+			r.push_back(a);
+		}
 	}
 	return r;
 }
 
 void Wallet::AddRecipient(const Address& a) {
-	if (a.Type != AddressType::P2PKH && a.Type != AddressType::P2SH)	//!!!TODO
+	if (a.Type != AddressType::P2PKH && a.Type != AddressType::P2SH && a.Type != AddressType::Bech32)
 		Throw(E_NOTIMPL);
-	HashValue160 hash160(a);
+	Blob data = a.Type == AddressType::Bech32
+		? a->ToScriptPubKey()
+		: Span(HashValue160(a));
 	EXT_LOCK (m_eng->m_cdb.MtxDb) {
 		SqliteCommand cmdSel(EXT_STR("SELECT netid FROM pubkeys WHERE netid=" << m_dbNetId << " AND type=? AND hash160=?"), m_eng->m_cdb.m_dbWallet);
 		cmdSel.Bind(1, (int)a.Type)
-			.Bind(2, hash160);
+			.Bind(2, data);
 		if (cmdSel.ExecuteReader().Read())
 			Throw(CoinErr::RecipientAlreadyPresents);
 
 		SqliteCommand cmd(EXT_STR("INSERT INTO pubkeys (netid, type, hash160, comment) VALUES(" << m_dbNetId << ", ?, ?, ?)"), m_eng->m_cdb.m_dbWallet);
 		cmd.Bind(1, (int)a.Type)
-			.Bind(2, hash160)
+			.Bind(2, data)
 			.Bind(3, a.Comment);
 		cmd.ExecuteNonQuery();
 	}
@@ -670,12 +689,15 @@ void Wallet::AddRecipient(const Address& a) {
 
 void Wallet::RemoveRecipient(RCString s) {
 	Address a(*m_eng, s);
-	if (a.Type != AddressType::P2PKH && a.Type != AddressType::P2SH)	//!!!TODO
+	if (a.Type != AddressType::P2PKH && a.Type != AddressType::P2SH && a.Type != AddressType::Bech32)
 		Throw(E_NOTIMPL);
-	HashValue160 hash160(a);
+	Blob data = a.Type == AddressType::Bech32
+		? a->ToScriptPubKey()
+		: Span(HashValue160(a));
 	EXT_LOCK (m_eng->m_cdb.MtxDb) {
-		SqliteCommand(EXT_STR("DELETE FROM pubkeys WHERE netid=" << m_dbNetId << " AND hash160=?"), m_eng->m_cdb.m_dbWallet)
-			.Bind(1, hash160)
+		SqliteCommand(EXT_STR("DELETE FROM pubkeys WHERE netid=" << m_dbNetId << " AND type=? AND hash160=?"), m_eng->m_cdb.m_dbWallet)
+			.Bind(1, (int)a.Type)
+			.Bind(2, data)
 			.ExecuteNonQuery();
 	}
 }
@@ -700,7 +722,7 @@ WalletTx Wallet::GetTx(const HashValue& hashTx) {
 }
 
 decimal64 Wallet::GetDecimalFee(const WalletTx& wtx) {
-	if (wtx.IsCoinBase())
+	if (wtx->IsCoinBase())
 		return 0;
 	int64_t sum = 0;
 	EXT_FOR (const TxIn& txIn, wtx.TxIns()) {
@@ -714,13 +736,12 @@ decimal64 Wallet::GetDecimalFee(const WalletTx& wtx) {
 }
 
 void Wallet::SetAddressComment(const Address& addr, RCString comment) {
+	if (m_eng->m_cdb.SetPrivkeyComment(addr, comment))
+		return;
+
 	if (addr.Type != AddressType::P2PKH && addr.Type != AddressType::P2SH)	//!!!TODO
 		Throw(E_NOTIMPL);
 	HashValue160 hash160(addr);
-
-	if (m_eng->m_cdb.SetPrivkeyComment(hash160, comment))
-		return;
-
 	EXT_LOCK (Mtx) {
 		vector<Address> ar = Recipients;
 		for (int i = 0; i < ar.size(); ++i) { //!!!TODO  INSERT OR IGNORE; UPDATE
@@ -758,14 +779,6 @@ void Wallet::put_MiningEnabled(bool b) {
 #endif
 }
 
-pair<CanonicalPubKey, HashValue160> Wallet::GetReservedPublicKey() {
-	EXT_LOCK (m_eng->m_cdb.MtxDb) {
-		KeyInfo ki = m_eng->m_cdb.FindReservedKey();
-		const CanonicalPubKey& pubKey = ki ? ki.PubKey : m_eng->m_cdb.Hash160ToKey.begin()->second.PubKey;
-		return make_pair(pubKey, pubKey.Hash160);
-	}
-}
-
 bool Wallet::SelectCoins(uint64_t amount, uint64_t fee, int nConfMine, int nConfTheirs, pair<unordered_set<Penny>, uint64_t>& pp) {
 	pp.first.clear();
 	pp.second = 0;
@@ -779,19 +792,18 @@ bool Wallet::SelectCoins(uint64_t amount, uint64_t fee, int nConfMine, int nConf
 			coin.OutPoint.TxHash = HashValue(dr.GetBytes(0));
 			coin.OutPoint.Index = dr.GetInt32(1);
 			coin.Value = dr.GetInt64(2);
-			coin.PkScript = dr.GetBytes(3);
+			coin.m_scriptPubKey = dr.GetBytes(3);
 			coins.push_back(coin);
 		}
 	}
 
 	Penny coinBestLarger;
 	int64_t totalLower = 0;
-	for (int i=coins.size(); i--;) {
+	for (int i = coins.size(); i--;) {
 		Penny& coin = coins[i];
 		WalletTx wtx = GetTx(coin.OutPoint.TxHash);
 		int depth = wtx.DepthInMainChain;
-		if (wtx.IsConfirmed(_self) &&
-			(!wtx.IsCoinBase() || depth > m_eng->ChainParams.CoinbaseMaturity+20) &&
+		if (wtx.IsConfirmed(_self) && (!wtx->IsCoinBase() || depth > m_eng->ChainParams.CoinbaseMaturity + 20) &&
 			depth >= (wtx.m_bFromMe || IsFromMe(wtx) ? nConfMine : nConfTheirs))
 		{
 			if (coin.Value >= amount) {
@@ -809,7 +821,7 @@ bool Wallet::SelectCoins(uint64_t amount, uint64_t fee, int nConfMine, int nConf
 		pp.second = coinBestLarger.Value;
 		return true;
 	}
-	for (int i=coins.size(); i--;) {
+	for (int i = coins.size(); i--;) {
 		Penny& coin = coins[i];
 		pp.first.insert(coin);
 		pp.second += coin.Value;
@@ -820,16 +832,16 @@ bool Wallet::SelectCoins(uint64_t amount, uint64_t fee, int nConfMine, int nConf
 	return true;
 }
 
-pair<unordered_set<Penny>, uint64_t> Wallet::SelectCoins(uint64_t amount, uint64_t fee) {
+pair<vector<Penny>, uint64_t> Wallet::SelectCoins(uint64_t amount, uint64_t fee) {
 	pair<unordered_set<Penny>, uint64_t> r;
 	if (SelectCoins(amount, fee, 1, 6, r) ||
 		SelectCoins(amount, fee, 1, 1, r) ||
 		SelectCoins(amount, fee, 0, 1, r))
-		return r;
+		return make_pair(vector<Penny>(r.first.begin(), r.first.end()), r.second);
 	Throw(CoinErr::InsufficientAmount);
 }
 
-pair<WalletTx, decimal64> Wallet::CreateTransaction(const KeyInfo& randomKey, const vector<pair<Address, int64_t>>& vSend) {
+pair<WalletTx, decimal64> Wallet::CreateTransaction(const KeyInfo& randomKey, const vector<pair<Address, int64_t>>& vSend, int64_t initialFee) {
 	if (vSend.empty())
 		Throw(errc::invalid_argument);
 	int64_t nVal = 0;
@@ -837,31 +849,32 @@ pair<WalletTx, decimal64> Wallet::CreateTransaction(const KeyInfo& randomKey, co
 		m_eng->CheckMoneyRange(nVal += vSend[i].second);
 
 	EXT_LOCK (Mtx) {
-		for (int64_t fee = 0;;) {
+		KeyInfo changeKeyInfo(nullptr);
+		for (int64_t fee = initialFee;;) {
 			WalletTx tx;
 			tx.EnsureCreate(*m_eng);
 			tx.m_bFromMe = true;
+			auto& txOuts = tx.TxOuts();
 
 			int64_t nTotal = nVal + fee;
 			for (int i = 0; i < vSend.size(); ++i) {
-				TxOut txOut(vSend[i].second, vSend[i].first.ToScriptPubKey());
+				TxOut txOut(vSend[i].second, vSend[i].first->ToScriptPubKey());
 				txOut.CheckForDust();
-				tx.TxOuts().push_back(txOut);
+				txOuts.push_back(txOut);
 			}
 
-			pair<unordered_set<Penny>, uint64_t> ppCoins = SelectCoins(nTotal, 0);
+			pair<vector<Penny>, uint64_t> ppCoins = SelectCoins(nTotal, 0);
 			double priority = 0;
-			EXT_FOR (const Penny& penny, ppCoins.first) {
+			tx->m_txIns.resize(ppCoins.first.size());
+			for (int i = 0; i < ppCoins.first.size(); ++i) {
+				auto& penny = ppCoins.first[i];
 				priority += double(penny.Value) * GetTx(penny.OutPoint.TxHash).DepthInMainChain;
-
-				TxIn txIn;
-				txIn.PrevOutPoint = penny.OutPoint;
-				tx.m_pimpl->m_txIns.push_back(txIn);
+				tx->m_txIns[i].PrevOutPoint = penny.OutPoint;
 			}
-			tx.m_pimpl->m_bLoadedIns = true;
+			tx->m_bLoadedIns = true;
 			int64_t nChange = ppCoins.second - nVal - fee;
 
-			if (fee < m_eng->ChainParams.MinTxFee && nChange > 0 && nChange < m_eng->ChainParams.CoinValue/100) {
+			if (fee < m_eng->ChainParams.MinTxFee && nChange > 0 && nChange < m_eng->ChainParams.CoinValue / 100) {
                 int64_t nMoveToFee = std::min(nChange, m_eng->ChainParams.MinTxFee - fee);
                 nChange -= nMoveToFee;
                 fee += nMoveToFee;
@@ -870,18 +883,20 @@ pair<WalletTx, decimal64> Wallet::CreateTransaction(const KeyInfo& randomKey, co
 				fee += exchange(nChange, 0);
 
 			if (nChange > 0) {
-				tx.ChangePubKey = GetReservedPublicKey().first;
-				const Address& a = vSend[0].first;
-				bool isAddress = a.Type == AddressType::P2PKH || a.Type == AddressType::P2SH;
-				Blob scriptChange = isAddress ? Address(*m_eng, AddressType::P2PKH, tx.ChangePubKey.Hash160).ToScriptPubKey() : Script::BlobFromPubKey(tx.ChangePubKey);	//!!!?
-				tx.TxOuts().insert(tx.TxOuts().begin() + Ext::Random().Next(tx.TxOuts().size()), TxOut(nChange, scriptChange));
+				if (!changeKeyInfo)
+					changeKeyInfo = randomKey ? randomKey : m_eng->m_cdb.GenerateNewAddress(g_conf.GetChangeType(), nullptr);	 //!!!TODO: consider ChangeType for RandomKey
+				tx.ChangeKeyInfo = changeKeyInfo;
+				Blob scriptChange = tx.ChangeKeyInfo->ToAddress()->ToScriptPubKey();
+				int randomPlace = Ext::Random().Next(txOuts.size() + 1);
+#ifdef _DEBUG//!!!D
+				randomPlace = 0;
+#endif
+				txOuts.insert(txOuts.begin() + randomPlace, TxOut(nChange, scriptChange));
 			}
 
 			WalletSigner signer(_self, tx);
-			int nIn = 0;
-			EXT_FOR (const Penny& penny, ppCoins.first) {
-				signer.Sign(randomKey, penny.PkScript, nIn++);
-			}
+			for (int i = 0; i < ppCoins.first.size(); ++i)
+				signer.Sign(randomKey, ppCoins.first[i], i);
 
 			m_eng->CheckForDust(tx);
 
@@ -895,9 +910,11 @@ pair<WalletTx, decimal64> Wallet::CreateTransaction(const KeyInfo& randomKey, co
 			if (fee >= minFee) {
 				decimal64 dfee = make_decimal64((long long)fee, -m_eng->ChainParams.Log10CoinValue());
 				TRC(3, make_decimal64((long long)nVal, -m_eng->ChainParams.Log10CoinValue()) << " " << Eng.ChainParams.Symbol << ",  Fee: " << dfee << " " << Eng.ChainParams.Symbol);
-				tx.Timestamp = Clock::now();
+				tx->Timestamp = Clock::now();
 				return pair<WalletTx, decimal64>(tx, dfee);
 			}
+			if (initialFee)
+				Throw(CoinErr::TxFeeIsLow);
 			fee = minFee;
 		}
 	}
@@ -919,20 +936,20 @@ void Wallet::Relay(const WalletTx& wtx) {
 #endif
 
 	EXT_FOR (const Tx& tx, wtx.PrevTxes) {
-		if (!tx.IsCoinBase()) {
-			TxInfo txInfo(tx, tx.GetSerializeSize());
+		if (!tx->IsCoinBase()) {
+			TxInfo txInfo(tx, 0);	// avoid calculating rate for my txes
 			m_eng->Relay(txInfo);
 		}
 	}
-	if (!wtx.IsCoinBase()) {
-		TxInfo txInfo(wtx, wtx.GetSerializeSize());
+	if (!wtx->IsCoinBase()) {
+		TxInfo txInfo(wtx, 0);
 		m_eng->Relay(txInfo);
 	}
 }
 
 void Wallet::Commit(WalletTx& wtx) {
-	if (wtx.ChangePubKey.Data.size() > 0)
-		m_eng->m_cdb.RemovePubKeyFromReserved(wtx.ChangePubKey);
+	if (wtx.ChangeKeyInfo)
+		m_eng->m_cdb.RemoveKeyInfoFromReserved(wtx.ChangeKeyInfo);
 	ProcessMyTx(wtx, true);
 	Relay(wtx);
 }
@@ -940,46 +957,38 @@ void Wallet::Commit(WalletTx& wtx) {
 void Wallet::ResendWalletTxes(const DateTime& now) {
 	if (EXT_LOCKED(m_eng->MtxPeers, m_eng->Links.empty()))
 		return;
-
-	if (now >= m_dtNextResend) {
-		SetNextResendTime(now);
-		if (m_dtLastResend < m_eng->Caches.DtBestReceived) {
-			m_dtLastResend = now;
-
-			EXT_LOCK (m_eng->Mtx) {
-				EXT_LOCK (m_eng->m_cdb.MtxDb) {
-					for (DbDataReader dr=m_eng->m_cdb.CmdPendingTxes.Bind(1, m_dbNetId).ExecuteReader(); dr.Read();) {
-						WalletTx wtx;
-						wtx.LoadFromDb(dr);
-						if (!wtx.IsCoinBase()) {
-
+	if (now < m_dtNextResend)
+		return;
+	SetNextResendTime(now);
+	if (m_dtLastResend >= m_eng->Caches.DtBestReceived)
+		return;
+	m_dtLastResend = now;
+	EXT_LOCK (m_eng->Mtx) {
+		EXT_LOCK (m_eng->m_cdb.MtxDb) {
+			for (DbDataReader dr=m_eng->m_cdb.CmdPendingTxes.Bind(1, m_dbNetId).ExecuteReader(); dr.Read();) {
+				WalletTx wtx;
+				wtx.LoadFromDb(dr);
+				if (!wtx->IsCoinBase()) {
 #ifdef X_DEBUG//!!!D
-							{
-								XmlTextWriter x("c:\\work\\coin\\tx.log");
-								x.Formatting = XmlFormatting::Indented;
-								x << wtx;
-							}
-							int64_t minFee = wtx.GetMinFee();
-							minFee = wtx.GetMinFee();
-							minFee = wtx.GetMinFee();
-							wtx.Check();
-#endif
-
-	#ifdef X_DEBUG//!!!D
-
-							TRC(1, "Tx: " << Hash(wtx));
-							EXT_FOR (const TxIn& txIn, wtx.TxIns) {
-								TRC(1, "TxIn: " << txIn.PrevOutPoint.TxHash);
-							}
-							EXT_FOR (const TxOut& txOut, wtx.TxOuts) {
-								TRC(1, "TxOut: " << txOut.Value);
-							}
-							vector<HashValue> vQueue;
-	//						pair<bool, bool> pp = m_eng->AddToPool(wtx, vQueue);
-	#endif
-							Relay(wtx);
-						}
+					{
+						XmlTextWriter x("c:\\work\\coin\\tx.log");
+						x.Formatting = XmlFormatting::Indented;
+						x << wtx;
 					}
+					int64_t minFee = wtx.GetMinFee();
+					minFee = wtx.GetMinFee();
+					wtx.Check();
+					TRC(1, "Tx: " << Hash(wtx));
+					EXT_FOR (const TxIn& txIn, wtx.TxIns) {
+						TRC(1, "TxIn: " << txIn.PrevOutPoint.TxHash);
+					}
+					EXT_FOR (const TxOut& txOut, wtx.TxOuts) {
+						TRC(1, "TxOut: " << txOut.Value);
+					}
+					vector<HashValue> vQueue;
+//						pair<bool, bool> pp = m_eng->AddToPool(wtx, vQueue);
+#endif
+					Relay(wtx);
 				}
 			}
 		}
@@ -987,14 +996,14 @@ void Wallet::ResendWalletTxes(const DateTime& now) {
 }
 
 void Wallet::OnPeriodic(const DateTime& now) {
-	if (!RescanThread)
+	if (!ThreadRescan)
 		ResendWalletTxes(now);
 }
 
 void Wallet::OnPeriodicForLink(Link& link) {
 }
 
-void Wallet::SendTo(const decimal64& decAmount, RCString saddr, RCString comment) {
+void Wallet::SendTo(const decimal64& decAmount, RCString saddr, RCString comment, const decimal64& decFee) {
 	TRC(0, decAmount << " " << m_eng->ChainParams.Symbol << " to " << saddr << " " << comment);
 
 	if (decAmount > Balance)
@@ -1002,9 +1011,8 @@ void Wallet::SendTo(const decimal64& decAmount, RCString saddr, RCString comment
 	int64_t amount = decimal_to_long_long(decAmount * m_eng->ChainParams.CoinValue);
 	if (0 == amount)
 		Throw(errc::invalid_argument);
-
 	vector<pair<Address, int64_t>> vSend(1, make_pair(Address(*m_eng, saddr), amount));
-	pair<WalletTx, decimal64> pp = CreateTransaction(nullptr, vSend);
+	pair<WalletTx, decimal64> pp = CreateTransaction(nullptr, vSend, decimal_to_long_long(decFee));
 	pp.first.Comment = comment;
 	t_features.PayToScriptHash = true;
 
@@ -1020,10 +1028,11 @@ decimal64 Wallet::CalcFee(const decimal64& amount) {
 		return make_decimal64((long long)m_eng->ChainParams.MinTxFee, - m_eng->ChainParams.Log10CoinValue());
 	if (amount > Balance)
 		Throw(CoinErr::InsufficientAmount);
-	Address addr(*m_eng, AddressType::P2PKH, GetReservedPublicKey().second); //!!!?
+	Address addr = m_eng->m_cdb.GenerateNewAddress(g_conf.GetAddressType(), nullptr)->ToAddress();
 	vector<pair<Address, int64_t>> vSend(1, make_pair(addr, decimal_to_long_long(amount * m_eng->ChainParams.CoinValue)));
 	KeyInfo randomKey;
-	randomKey.m_pimpl->GenRandom();
+	Rng rng;
+	randomKey->GenRandom(rng);
 	return CreateTransaction(randomKey, vSend).second;
 }
 

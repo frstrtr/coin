@@ -8,6 +8,8 @@
 #include <el/crypto/hash.h>
 using namespace Ext::Crypto;
 
+#include <random>
+
 #include EXT_HEADER_OPTIONAL
 
 #ifndef UCFG_COIN_ECC
@@ -15,7 +17,7 @@ using namespace Ext::Crypto;
 #endif
 
 #ifndef UCFG_COIN_USE_OPENSSL
-#	define UCFG_COIN_USE_OPENSSL 1
+#	define UCFG_COIN_USE_OPENSSL 0
 #endif
 
 #if UCFG_COIN_ECC != 'S' && UCFG_COIN_USE_OPENSSL
@@ -83,7 +85,7 @@ ENUM_CLASS(HashAlgo){Sha256, Sha3, SCrypt, Prime, Momentum, Solid, Metis, NeoSCr
 HashAlgo StringToAlgo(RCString s);
 String AlgoToString(HashAlgo algo);
 
-class HashValue : totally_ordered<HashValue> {
+class HashValue : Ext::totally_ordered<HashValue> {
 	uint64_t m_data[4];
 public:
 	typedef uint8_t* iterator;
@@ -170,11 +172,13 @@ public:
 COIN_UTIL_API ostream& operator<<(ostream& os, const HashValue& hash);
 COIN_UTIL_API wostream& operator<<(wostream& os, const HashValue& hash);
 
+/*!!!R collision with tests
 inline String ToString(const HashValue& hash) {
 	ostringstream os;
 	os << hash;
 	return os.str();
 }
+*/
 
 /*!!!?
 inline wostream& operator<<(wostream& os, const HashValue& hash) {
@@ -262,6 +266,7 @@ public:
 };
 
 class ReducedBlockHash {
+	Span m_buf;
 public:
 	ReducedBlockHash(const HashValue& hash)
 		: m_buf(hash.ToSpan())
@@ -272,8 +277,6 @@ public:
 
     const uint8_t *data() const { return m_buf.data(); }
     size_t size() const { return m_buf.size(); }
-private:
-	Span m_buf;
 };
 
 COIN_UTIL_EXPORT HashValue Hash(RCSpan mb);
@@ -304,7 +307,7 @@ class ProtocolWriter : public BinaryWriter {
 public:
 	// Used in SignatureHash only
 	Span ClearedScript;
-	int NIn;		
+	int NIn;
 	CBool ForSignatureHash, HashTypeSingle, HashTypeNone, HashTypeAnyoneCanPay;
 	CBool WitnessAware;
 
@@ -320,7 +323,7 @@ public:
 class ProtocolReader : public BinaryReader {
     typedef BinaryReader base;
 public:
-    CBool WitnessAware;
+    CBool WitnessAware, MayBeHeader;
 
     explicit ProtocolReader(const Stream& stm, bool witnessAware = false)
 		: base(stm)
@@ -335,15 +338,17 @@ struct ShortTxId {
 
 class CoinSerialized {
 public:
+	static const uint32_t MAX_SIZE = 32 * 1024 * 1024;
+
 	uint32_t Ver;
 
 	CoinSerialized()
 		: Ver(1) {
 	}
 
-	static void WriteVarUInt64(BinaryWriter& wr, uint64_t v);
-	static uint64_t ReadVarUInt64(const BinaryReader& rd);
-	static uint32_t ReadVarSize(const BinaryReader& rd);
+	static void WriteCompactSize(BinaryWriter& wr, uint64_t v);
+	static uint64_t ReadCompactSize64(const BinaryReader& rd);
+	static uint32_t ReadCompactSize(const BinaryReader& rd);
 	static String ReadString(const BinaryReader& rd);
 	static void WriteString(BinaryWriter& wr, RCString s);
 	static void WriteSpan(BinaryWriter& wr, RCSpan mb);
@@ -363,7 +368,7 @@ public:
 
 	template <class T>
     static void Write(ProtocolWriter& wr, const vector<T>& ar) {
-		WriteVarUInt64(wr, ar.size());
+		WriteCompactSize(wr, ar.size());
         for (size_t i = 0; i < ar.size(); ++i)
             WriteEl(wr, ar[i]);
 	}
@@ -380,12 +385,12 @@ public:
     template <class T>
     static void ReadEl(const ProtocolReader& rd, T& v) { v.Read(rd); }
 
-	template <class T> static void Read(const ProtocolReader& rd, vector<T>& ar, size_t maxSize = SIZE_MAX) {
-        uint32_t size = ReadVarSize(rd);
+	template <class T> static void Read(const ProtocolReader& rd, vector<T>& ar, size_t maxSize = MAX_SIZE) {
+        uint32_t size = ReadCompactSize(rd);
         if (size > maxSize)
             Throw(ExtErr::Protocol_Violation);
 		ar.resize(size);
-		for (size_t i = 0; i < ar.size(); ++i)
+		for (size_t i = 0; i < size; ++i)
 			ReadEl(rd, ar[i]);
 	}
 };
@@ -398,19 +403,47 @@ struct BlockHeaderBinary {
 		Timestamp, DifficultyTargetBits, Nonce;
 };
 
+class BlockRef {
+public:
+	const HashValue Hash;
+	const int HeightInTrunk;
+
+	BlockRef(int h)
+		: HeightInTrunk(h)
+	{}
+
+	BlockRef(int h, const HashValue& hash)
+		: Hash(hash)
+		, HeightInTrunk(h)
+	{}
+
+	BlockRef(const HashValue& hash)
+		: Hash(hash)
+		, HeightInTrunk(-1)
+	{}
+
+	explicit operator bool() const { return HeightInTrunk >= 0 || Hash; }
+	bool IsInTrunk() const { return HeightInTrunk >= 0; }
+};
+
 class COIN_UTIL_CLASS BlockBase : public InterlockedObject {
 public:
 	HashValue PrevBlockHash;
 	mutable optional<HashValue> m_merkleRoot;
 	DateTime Timestamp;
 	uint32_t DifficultyTargetBits;
-	int32_t Ver;
+	int32_t Ver;						// Important to be signed
 	uint32_t Height;
 	uint32_t Nonce;
+	CBool IsInTrunk;
 
 	BlockBase()
-		: Ver(3)
+		: Ver(4)
 		, Height(uint32_t(-1)) {
+	}
+
+	BlockRef Prev() const {
+		return IsInTrunk ? BlockRef(Height - 1, PrevBlockHash) : BlockRef(PrevBlockHash);
 	}
 
 	virtual void WriteHeader(ProtocolWriter& wr) const;
@@ -447,11 +480,13 @@ const char DEFAULT_PASSWORD_ENCRYPT_METHOD = 'B';
 class HasherEng : public InterlockedObject {
 public:
 	String Hrp;
+	char HrpSeparator;
 	uint8_t AddressVersion, ScriptAddressVersion;
 
 	HasherEng()
 		: AddressVersion(0)
 		, ScriptAddressVersion(5)
+		, HrpSeparator('1')
     {
 		Hrp = "bc";
     }
@@ -472,18 +507,17 @@ public:
 	~CHasherEngThreadKeeper();
 };
 
-class PrivateKey : public CPrintable {
+class PrivateKey : public array<uint8_t, 32>, public CPrintable{
 public:
-	PrivateKey() {
+	bool Compressed;
+
+	PrivateKey()
+		: Compressed(false)
+	{
 	}
 	PrivateKey(RCSpan cbuf, bool bCompressed);
 	explicit PrivateKey(RCString s);
-	pair<Blob, bool> GetPrivdataCompressed() const;
 	String ToString() const override;
-
-private:
-	typedef vararray<uint8_t, 33> CData;
-	CData m_data;
 };
 
 class CanonicalPubKey {
@@ -514,6 +548,9 @@ public:
 	}
 	DEFPROP_GET(HashValue160, Hash160);
 
+	HashValue160 get_ScriptHash() const;
+	DEFPROP_GET(HashValue160, ScriptHash);
+
 	bool IsValid() const {
 		uint8_t b0 = Data.constData()[0];
 		return (Data.size() == 33 && (b0 == 2 || b0 == 3)) || (Data.size() == 65 || b0 == 4);
@@ -541,6 +578,8 @@ enum class AddressType : uint8_t {				// Used in WalletDb in pubkeys.type field
 	, WitnessV0KeyHash = 7
 	, WitnessUnknown = 8
 	, NonStandard = 9
+	, P2WPKH_IN_P2SH = 10
+	, P2WSH_IN_P2SH = 11
 };
 
 class COIN_CLASS AddressObj : public InterlockedObject {
@@ -560,7 +599,7 @@ public:
 	AddressObj(HasherEng& hasher, RCString s, RCString comment);
 	String ToString() const;
 	Blob ToScriptPubKey() const;
-	void DecodeBech32(HasherEng& hasher, RCString s);
+	void DecodeBech32(RCString hrp, RCString s);
 	void CheckVer(HasherEng& hasher) const;
 };
 
@@ -588,7 +627,6 @@ public:
 
 	uint8_t WitnessVer() const { return m_pimpl->WitnessVer; }
 	String ToString() const override { return m_pimpl->ToString(); }
-	Blob ToScriptPubKey() const { return m_pimpl->ToScriptPubKey(); }
 	explicit operator HashValue160() const;
 	explicit operator HashValue() const;
 
@@ -599,18 +637,26 @@ public:
 	Span Data() const { return m_pimpl->Data; }
 
 	bool operator==(const Address& a) const {
-		return m_pimpl->Type == a.m_pimpl->Type && Equal(m_pimpl->Data, a.m_pimpl->Data);
+		return m_pimpl->Type == a->Type && Equal(m_pimpl->Data, a->Data);
 	}
 
 	bool operator<(const Address& a) const {
-		return m_pimpl->Type < a.m_pimpl->Type || (m_pimpl->Type == a.m_pimpl->Type && memcmp(m_pimpl->Data.data(), a.m_pimpl->Data.data(), m_pimpl->Data.size()) < 0); //!!!TODO: use WitnessVer & maybe Comment
+		return m_pimpl->Type < a->Type || (m_pimpl->Type == a->Type && memcmp(m_pimpl->Data.data(), a->Data.data(), m_pimpl->Data.size()) < 0); //!!!TODO: use WitnessVer & maybe Comment
 	}
+};
+
+class Rng : noncopyable {
+	mt19937 m_rng;
+	uniform_int_distribution<> m_ud;;
+public:
+	Rng();
+	uint8_t operator()() { return (uint8_t)m_ud(m_rng); }
 };
 
 class KeyInfoBase : public InterlockedObject {
 	typedef KeyInfoBase class_type;
 
-	Blob m_privKey;
+	PrivateKey m_privKey;
 public:
 	CanonicalPubKey PubKey;
 
@@ -619,31 +665,32 @@ public:
 #endif
 
 	DateTime Timestamp;
-	String Comment;
+	String Comment;					// nullptr for change or reserved
 	AddressType AddressType;
+	bool Reserved;
 
 	KeyInfoBase()
 		: AddressType(AddressType::Legacy)
+		, Reserved(false)
 	{
 	}
 
-	void GenRandom(bool bCompressed = true);
+	void GenRandom(Rng& rng, bool bCompressed = true);
 
 	Blob PlainPrivKey() const;
 
-	Blob get_PrivKey() const {
+	const PrivateKey& get_PrivKey() const {
 		return m_privKey;
 	}
-	DEFPROP_GET(Blob, PrivKey);
+	DEFPROP_GET(const PrivateKey&, PrivKey);
 
 	vararray<uint8_t, 25> ToPubScript() const;
 	Address ToAddress() const;
-	void SetPrivData(RCSpan cbuf, bool bCompressed);
-	void SetPrivData(const PrivateKey& privKey);
+	void SetPrivData(const PrivateKey& privKey, bool bCompressed);
+	void SetPrivData(const PrivateKey& privKey) { SetPrivData(privKey, privKey.Compressed); }
 	void SetKeyFromPubKey();
 	String ToString(RCString password) const; // To WIF / BIP0038 formats
 	Blob SignHash(RCSpan cbuf);
-	static bool VerifyHash(RCSpan pubKey, const HashValue& hash, RCSpan sig);
 
 	Blob ToPrivateKeyDER() const;
 	void FromDER(RCSpan privKey, RCSpan pubKey);
@@ -665,6 +712,12 @@ template <> struct hash<Coin::HashValue160> {
 	size_t operator()(const Coin::HashValue160& v) const {
 		return *(size_t*)v.data();
 		//		return hash<std::array<uint8_t, 20>>()(v);
+	}
+};
+
+template <> struct hash<Coin::Address> {
+	size_t operator()(const Coin::Address& a) const {
+		return hash<String>()(a.ToString());		//!!!TODO Optimize
 	}
 };
 

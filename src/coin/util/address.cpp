@@ -39,7 +39,7 @@ AddressObj::AddressObj(HasherEng& hasher, RCString s, RCString comment)
 {
 	try {
 		if (s.StartsWith(hasher.Hrp))
-			DecodeBech32(hasher, s);
+			DecodeBech32(hasher.Hrp, s);
 		else {
 			Blob blob = ConvertFromBase58(s.Trim());
 			if (blob.size() < 21)
@@ -61,7 +61,7 @@ AddressObj::AddressObj(HasherEng& hasher, RCString s, RCString comment)
 }
 
 Address& Address::operator=(const Address& a) {
-	if (&m_pimpl->Hasher != &a.m_pimpl->Hasher)
+	if (&m_pimpl->Hasher != &a->Hasher)
 		Throw(errc::invalid_argument);
 	m_pimpl = new AddressObj(*a.m_pimpl);
  	return *this;
@@ -90,8 +90,10 @@ static const char s_base32ToChar[33] = "qpzry9x8gf2tvdw0s3jn54khce6mua7l";
 static uint8_t s_base32FromChar[256];
 
 static bool InitBase32FromChar() {
-	for (uint8_t i = 0; i < 32; ++i)
-		s_base32FromChar[s_base32ToChar[i]] = i;
+	for (uint8_t i = 0; i < 32; ++i) {
+		char ch = s_base32ToChar[i];
+		s_base32FromChar[ch] = s_base32FromChar[toupper(ch)] = i;
+	}
 	return true;
 }
 
@@ -104,14 +106,14 @@ static int Bech32Polymod(RCSpan cb) {
 		int b = chk >> 25;
 		chk = ((chk & 0x1ffffff) << 5) ^ cb[i];
 		for (int j = 0; j < 5; ++j)
-			chk ^= b & (1 << j) ? GEN[i] : 0;
+			chk ^= b & (1 << j) ? GEN[j] : 0;
 	}
 	return chk;
 }
 
 static void FillBech32Checksum(uint8_t buf[], size_t len) {
 	buf[len - 1] = buf[len - 2] = buf[len - 3] = buf[len - 4] = buf[len - 5] = buf[len - 6] = 0;
-	int chk = Bech32Polymod(ConstBuf(buf, len));
+	int chk = Bech32Polymod(ConstBuf(buf, len)) ^ 1;
 	for (int i = 6; i--;)
 		buf[len - 6 + i] = uint8_t((chk >> 5 * (5 - i)) & 31);
 }
@@ -162,6 +164,8 @@ String AddressObj::ToString() const {
 		v[0] = Hasher.ScriptAddressVersion;
 		memcpy(&v[1], Data.data(), 20);
 		return ConvertToBase58(Span(v));
+	case AddressType::WitnessV0KeyHash:
+	case AddressType::WitnessV0ScriptHash:
 	case AddressType::Bech32: {
 		uint8_t buf[Address::MAX_LEN * 3]; // enough for max Hrp & Data
 		auto hrpLen = ExpandHrp(buf, Hasher.Hrp);
@@ -170,7 +174,7 @@ String AddressObj::ToString() const {
 		for (size_t i = sdata.length(); i--;)
 			buf[hrpLen * 2 + 2 + i] = s_base32FromChar[sdata[i]];
 		FillBech32Checksum(buf, hrpLen * 2 + 2 + sdata.length() + 6);
-		char sbuf[100] = "1";
+		char sbuf[100] = { Hasher.HrpSeparator };
 		for (size_t i = 1 + sdata.length() + 6; i--;)
 			sbuf[i + 1] = s_base32ToChar[buf[hrpLen * 2 + 1 + i]];
 		return Hasher.Hrp + String(sbuf, 2 + sdata.length() + 6);
@@ -180,11 +184,13 @@ String AddressObj::ToString() const {
 	}
 }
 
-static regex s_reBech32Adrress("^([-!\"#$%&\'()*+,./:;<=>?@\\[\\]\\\\^_`{|}~a-z0-1]{1,83})1([02-9ac-hj-np-z]{6,})$");
+static regex
+	s_reBech32AdrressOne(  "^([-!\"#$%&\'()*+,./:;<=>?@\\[\\]\\\\^_`{|}~a-z0-1]{1,83})1([02-9ac-hj-np-z]{6,})$"),
+	s_reBech32AdrressColon("^([-!\"#$%&\'()*+,./:;<=>?@\\[\\]\\\\^_`{|}~a-z0-1]{1,83}):([02-9ac-hj-np-z]{6,})$");
 
 // BIP173
-void AddressObj::DecodeBech32(HasherEng& hasher, RCString s) {
-	if (s.length() < Address::MAX_LEN)
+void AddressObj::DecodeBech32(RCString hrp, RCString s) {
+	if (s.length() > Address::MAX_LEN)
 		Throw(CoinErr::InvalidAddress);
 	char lower[Address::MAX_LEN + 1];
 	bool bHasLower = false, bHasUpper = false;
@@ -196,26 +202,35 @@ void AddressObj::DecodeBech32(HasherEng& hasher, RCString s) {
 		bHasUpper |= (bool)isupper(ch);
 		lower[i] = (char)tolower(ch);
 	}
-	lower[s.length()] = 0;
-	cmatch m;
-	if (!regex_match(lower, m, s_reBech32Adrress))
+	if (bHasLower && bHasUpper)
 		Throw(CoinErr::InvalidAddress);
-	if (String(m[1]) != hasher.Hrp)
+	lower[s.length()] = 0;
+	regex* pre = Hasher.HrpSeparator == '1' ? &s_reBech32AdrressOne
+		: Hasher.HrpSeparator == ':' ? &s_reBech32AdrressColon
+		: 0;
+	if (!pre)
+		Throw(E_NOTIMPL);
+	cmatch m;
+	if (!regex_match(lower, m, *pre) || String(m[1]) != hrp)
 		Throw(CoinErr::InvalidAddress);
 	String data = String(m[2]);
 	uint8_t buf[Address::MAX_LEN * 3]; // enough for max Hrp & Data
-	auto hrpLen = ExpandHrp(buf, hasher.Hrp);
+	auto hrpLen = ExpandHrp(buf, hrp);
 	for (int i = data.length(); i--;)
-		buf[hrpLen * 2 + 1 + i] = s_base32FromChar[data[i] - '0'];
-	if (1 != Bech32Polymod(ConstBuf(buf, hasher.Hrp.length() * 2 + 1 + data.length())))
+		buf[hrpLen * 2 + 1 + i] = s_base32FromChar[data[i]];
+	if (1 != Bech32Polymod(ConstBuf(buf, hrpLen * 2 + 1 + data.length())))
 		Throw(CoinErr::InvalidAddress);
 	if (data.length() < 11)
 		Throw(CoinErr::InvalidAddress);
-	Blob witnessProgram = Convert::FromBase32String(data.substr(1, data.length() - 7), s_base32FromChar);
-	Data.resize(witnessProgram.size());
-	memcpy(Data.data(), witnessProgram.constData(), Data.size());
 	if ((WitnessVer = buf[hrpLen * 2 + 1]) > 16)
 		Throw(CoinErr::InvalidAddress);
+	Blob witnessProgram = Convert::FromBase32String(data.substr(1, data.length() - 7), s_base32FromChar);
+	if (witnessProgram.size() > MAX_WITNESS_PROGRAM)
+		Throw(CoinErr::InvalidAddress);
+	if (WitnessVer == 0 && witnessProgram.size() != 20 && witnessProgram.size() != 32)
+		Throw(CoinErr::InvalidAddress);
+	Data.resize(witnessProgram.size());
+	memcpy(Data.data(), witnessProgram.constData(), Data.size());
 	Type = AddressType::Bech32;
 }
 

@@ -76,8 +76,8 @@ void TxOut::Write(BinaryWriter& wr) const {
 }
 
 void TxOut::Read(const BinaryReader& rd) {
-	rd >> Value;
-	uint32_t size = CoinSerialized::ReadVarSize(rd);
+	Value = rd.ReadInt64();
+	uint32_t size = CoinSerialized::ReadCompactSize(rd);
 	if (size > MAX_BLOCK_WEIGHT)	//!!!?
 		Throw(ExtErr::Protocol_Violation);
 	m_scriptPubKey.resize(size, false);
@@ -159,7 +159,7 @@ void CFutureTxMap::Ensure(const HashValue& hash) {
 static Txo LoadTxoFromDbAsync(CoinEng* eng, OutPoint op, int height) {
 	Tx tx;
 	if (eng->Db->FindTx(op.TxHash, &tx)) {		// Don't use the cache as it is usually one-time operation
-		if (tx.IsCoinBase())
+		if (tx->IsCoinBase())
 			eng->CheckCoinbasedTxPrev(height, tx.Height);
 		try {
 			return tx.TxOuts().at(op.Index);
@@ -441,17 +441,17 @@ void TxObj::Write(ProtocolWriter& wr) const {
 
 	auto& txIns = TxIns();
 	if (wr.HashTypeAnyoneCanPay) {
-		WriteVarUInt64(wr, 1);
+		WriteCompactSize(wr, 1);
 		txIns[wr.NIn].Write(wr, true);
 	} else {
 		size_t nTxIn = txIns.size();
-		WriteVarUInt64(wr, nTxIn);
+		WriteCompactSize(wr, nTxIn);
 		for (size_t i = 0; i < nTxIn; ++i)
 			txIns[i].Write(wr, i == wr.NIn);
 	}
 
 	auto nOuts = wr.HashTypeNone ? 0 : wr.HashTypeSingle ? wr.NIn + 1 : (int)TxOuts.size();
-	WriteVarUInt64(wr, nOuts);
+	WriteCompactSize(wr, nOuts);
 	for (size_t i = 0; i < nOuts; ++i)
 		if (wr.HashTypeSingle && i != wr.NIn)
 			CoinSerialized::WriteSpan(wr << int64_t(-1), Span());
@@ -460,7 +460,7 @@ void TxObj::Write(ProtocolWriter& wr) const {
 
 	if (hasWitness)
 		for (auto& txIn : txIns) {
-			WriteVarUInt64(wr, txIn.Witness.size());
+			WriteCompactSize(wr, txIn.Witness.size());
 			for (auto& chunk : txIn.Witness)
 				CoinSerialized::WriteSpan(wr, chunk);
     	}
@@ -475,7 +475,10 @@ void TxObj::Read(const ProtocolReader& rd) {
 	Ver = rd.ReadUInt32();
 	ReadPrefix(rd);
 	CoinSerialized::Read(rd, m_txIns);
-	if (m_txIns.empty() && rd.WitnessAware) {
+	if (!m_txIns.empty() || !rd.WitnessAware) {
+		m_bLoadedIns = true;
+		CoinSerialized::Read(rd, TxOuts);
+	} else {
 		uint8_t flag = rd.ReadByte();
 		if (!flag)
 			throw PeerMisbehavingException(10);
@@ -484,13 +487,10 @@ void TxObj::Read(const ProtocolReader& rd) {
 		CoinSerialized::Read(rd, TxOuts);
 		if (flag & 1)
 			for (auto& txIn : m_txIns) {
-				txIn.Witness.resize(CoinSerialized::ReadVarSize(rd));
+				txIn.Witness.resize(CoinSerialized::ReadCompactSize(rd));
 				for (auto& chunk : txIn.Witness)
 					chunk = CoinSerialized::ReadBlob(rd);
 			}
-	} else {
-		m_bLoadedIns = true;
-		CoinSerialized::Read(rd, TxOuts);
 	}
 	if (m_txIns.empty() || TxOuts.empty())
 		throw PeerMisbehavingException(10);
@@ -667,7 +667,7 @@ void Tx::Check() const {
 	if (TxOuts().empty())
 		Throw(CoinErr::BadTxnsVoutEmpty);
 
-	bool bIsCoinBase = IsCoinBase();
+	bool bIsCoinBase = m_pimpl->IsCoinBase();
 	int64_t nOut = 0;
 	EXT_FOR(const TxOut& txOut, TxOuts()) {
 		if (!txOut.IsEmpty()) {
@@ -797,7 +797,7 @@ int64_t Tx::get_ValueOut() const {
 }
 
 int64_t Tx::get_Fee() const {
-	if (IsCoinBase())
+	if (m_pimpl->IsCoinBase())
 		return 0;
 	int64_t sum = 0;
 	EXT_FOR(const TxIn& txIn, TxIns()) {
@@ -808,12 +808,12 @@ int64_t Tx::get_Fee() const {
 
 int Tx::get_DepthInMainChain() const {
 	CoinEng& eng = Eng();
-	Block bestBlock = eng.BestBlock();
+	BlockHeader bestBlock = eng.BestBlock();
 	return Height >= 0 && bestBlock ? bestBlock.Height - Height + 1 : 0;
 }
 
 unsigned Tx::GetP2SHSigOpCount(const ITxoMap& txoMap) const {
-	if (IsCoinBase())
+	if (m_pimpl->IsCoinBase())
 		return 0;
 	int r = 0;
 	EXT_FOR(const TxIn& txIn, TxIns()) {
@@ -847,7 +847,7 @@ pair<int, DateTime> Tx::CalculateSequenceLocks(vector<int>& inHeights, const Has
 
 void Tx::CheckInOutValue(int64_t nValueIn, int64_t& nFees, int64_t minFee, const Target& target) const {
 	int64_t valOut = ValueOut;
-	if (IsCoinStake())
+	if (m_pimpl->IsCoinStake())
 		m_pimpl->CheckCoinStakeReward(valOut - nValueIn, target);
 	else {
 		if (nValueIn < valOut)
@@ -867,7 +867,7 @@ void Tx::ConnectInputs(CoinsView& view, int32_t height, int& nBlockSigOps, int64
     if (nSigOp > MAX_BLOCK_SIGOPS_COST)
         Throw(CoinErr::TxTooManySigOps);
 
-	if (!IsCoinBase()) {
+	if (!m_pimpl->IsCoinBase()) {
 		vector<Txo> vTxo;
 		int64_t nValueIn = 0;
 		if (eng.Mode != EngMode::Lite) {
@@ -876,6 +876,7 @@ void Tx::ConnectInputs(CoinsView& view, int32_t height, int& nBlockSigOps, int64
 			SignatureHasher sigHasher(*m_pimpl);
 			if (bVerifySignature && m_pimpl->HasWitness())
 				sigHasher.CalcWitnessCache();
+			eng.PatchSigHasher(sigHasher);
 
 			auto& txIns = TxIns();
 			for (uint32_t i = 0; i < txIns.size(); ++i) {
@@ -896,11 +897,9 @@ void Tx::ConnectInputs(CoinsView& view, int32_t height, int& nBlockSigOps, int64
 					if (!txPrev)
 						txPrev = FromDb(op.TxHash);
 				}
-				if (op.Index >= txPrev.TxOuts().size())
-					Throw(E_FAIL);
-				const TxOut& txOut = txPrev.TxOuts()[op.Index];
+				const TxOut& txOut = txPrev.TxOuts().at(op.Index);
 
-				if (txPrev.IsCoinBase())
+				if (txPrev->IsCoinBase())
 					eng.CheckCoinbasedTxPrev(height, txPrev.Height);
 
 				if (!view.HasInput(op))
@@ -948,7 +947,7 @@ unsigned Tx::SigOpCost(const ITxoMap& txoMap) const {
 		}
 	}
     r *= WITNESS_SCALE_FACTOR;
-    if (!IsCoinBase()) {
+    if (!m_pimpl->IsCoinBase()) {
         r += GetP2SHSigOpCount(txoMap) * WITNESS_SCALE_FACTOR;
 
         for (auto& txIn : txIns)
@@ -961,30 +960,40 @@ DbWriter& operator<<(DbWriter& wr, const Tx& tx) {
 	CoinEng& eng = Eng();
 
 	if (!wr.BlockchainDb) {
-		wr.Write7BitEncoded(tx.m_pimpl->Ver);
-		tx.m_pimpl->WritePrefix(wr);
+		wr.Write7BitEncoded(tx->Ver);
+		tx->WritePrefix(wr);
+		auto hasWitness = tx->HasWitness();
+		if (hasWitness)
+			(ProtocolWriter&)wr << uint8_t(0) << uint8_t(1);
 
 		const vector<TxIn>& txIns = tx.TxIns();
 		size_t nIns = txIns.size();
 		wr.WriteSize(nIns);
-		for (size_t i = 0; i < nIns; ++i)
-			txIns[i].Write(wr);
+		for (auto& txIn : txIns)
+			txIn.Write(wr);
 
 		Write(wr, tx.TxOuts());
+		if (hasWitness)
+			for (auto& txIn : txIns) {
+				CoinSerialized::WriteCompactSize(wr, txIn.Witness.size());
+				for (auto& chunk : txIn.Witness)
+					CoinSerialized::WriteSpan(wr, chunk);
+			}
+
 		wr.Write7BitEncoded(tx.LockBlock);
-		tx.m_pimpl->WriteSuffix(wr);
+		tx->WriteSuffix(wr);
 	} else {
 #if UCFG_COIN_USE_NORMAL_MODE
-		uint64_t v = uint64_t(tx.m_pimpl->Ver) << 2;
+		uint64_t v = uint64_t(tx->Ver) << 2;
 		if (tx.IsCoinBase())
 			v |= 1;
 		if (tx.LockBlock)
 			v |= 2;
 		wr.Write7BitEncoded(v);
-		tx.m_pimpl->WritePrefix(wr);
+		tx->WritePrefix(wr);
 		if (tx.LockBlock)
 			wr.Write7BitEncoded(tx.LockBlock);
-		tx.m_pimpl->WriteSuffix(wr);
+		tx->WriteSuffix(wr);
 
 		auto& txOuts = tx.TxOuts();
 		for (int i = 0; i < txOuts.size(); ++i) {
@@ -1041,22 +1050,36 @@ const DbReader& operator>>(const DbReader& rd, Tx& tx) {
 
 	if (!rd.BlockchainDb) {
 		v = rd.Read7BitEncoded();
-		tx.m_pimpl->Ver = (uint32_t)v;
-		tx.m_pimpl->ReadPrefix(rd);
-		Read(rd, tx.m_pimpl->m_txIns);
-		Read(rd, tx.m_pimpl->TxOuts);
-		tx.m_pimpl->m_bLoadedIns = true;
-		tx.m_pimpl->LockBlock = (uint32_t)rd.Read7BitEncoded();
-		tx.m_pimpl->ReadSuffix(rd);
+		tx->Ver = (uint32_t)v;
+		tx->ReadPrefix(rd);
+		Read(rd, tx->m_txIns);
+		if (!tx->m_txIns.empty())
+			Read(rd, tx->TxOuts);
+		else {
+			uint8_t flag = rd.ReadByte();
+			if (!flag)
+				Throw(CoinErr::InconsistentDatabase);
+			Read(rd, tx->m_txIns);
+			Read(rd, tx->TxOuts);
+			if (flag & 1)
+				for (auto& txIn : tx->m_txIns) {
+					txIn.Witness.resize(CoinSerialized::ReadCompactSize(rd));
+					for (auto& chunk : txIn.Witness)
+						chunk = CoinSerialized::ReadBlob(rd);
+				}
+		}
+		tx->m_bLoadedIns = true;
+		tx->LockBlock = (uint32_t)rd.Read7BitEncoded();
+		tx->ReadSuffix(rd);
 	} else {
 #if UCFG_COIN_USE_NORMAL_MODE
 		v = rd.Read7BitEncoded();
-		tx.m_pimpl->Ver = (uint32_t)(v >> 2);
-		tx.m_pimpl->ReadPrefix(rd);
-		tx.m_pimpl->m_bIsCoinBase = v & 1;
+		tx->Ver = (uint32_t)(v >> 2);
+		tx->ReadPrefix(rd);
+		tx->m_bIsCoinBase = v & 1;
 		if (v & 2)
 			tx.LockBlock = (uint32_t)rd.Read7BitEncoded();
-		tx.m_pimpl->ReadSuffix(rd);
+		tx->ReadSuffix(rd);
 
 #if UCFG_COIN_TXES_IN_BLOCKTABLE
 		for (int i = 0; i < rd.NOut; ++i) {
@@ -1093,7 +1116,7 @@ const DbReader& operator>>(const DbReader& rd, Tx& tx) {
 #endif // UCFG_COIN_USE_NORMAL_MODE
 	}
 	if (Tx::LocktimeTypeOf(tx.LockBlock) == Tx::LocktimeType::Timestamp)
-		tx.m_pimpl->LockTimestamp = DateTime::from_time_t(tx.LockBlock);
+		tx->LockTimestamp = DateTime::from_time_t(tx.LockBlock);
 	return rd;
 }
 

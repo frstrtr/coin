@@ -21,27 +21,26 @@ class WalletTx : public Tx {
 public:
 	typedef InterlockedPolicy interlocked_policy;
 
-	DateTime Timestamp;
 	Address To;
-	CanonicalPubKey ChangePubKey;
+	KeyInfo ChangeKeyInfo;
 	int64_t Amount;				// negative for Debits in COM transactions
 	vector<Tx> PrevTxes;
 	String Comment;
 	CBool m_bFromMe;
 
 	WalletTx()
-		:	To(Eng())
-//		:	Confirmations(0)
+		: To(Eng())
 	{}
 
 	explicit WalletTx(const Tx& tx);
 
+	DateTime Timestamp() const;
 	void LoadFromDb(DbDataReader& sr, bool bLoadExt = false);
 	bool IsConfirmed(Wallet& wallet) const;
 	String GetComment() const;
 
 	String UniqueKey() const {		//!!!T
-		return Convert::ToString(Timestamp.Ticks)+To.ToString();
+		return Convert::ToString(Timestamp().Ticks) + To.ToString();
 	}
 
 	decimal64 GetDecimalAmount() const { return make_decimal64((long long)Amount, -Eng().ChainParams.Log10CoinValue()); }
@@ -51,34 +50,6 @@ DbWriter& operator<<(DbWriter& wr, const WalletTx& wtx);
 const DbReader& operator>>(const DbReader& rd, WalletTx& wtx);
 
 
-class Penny {
-	typedef Penny class_type;
-public:
-	Coin::OutPoint OutPoint;
-	uint64_t Value;
-	Blob PkScript;
-	CBool IsSpent;
-
-	Penny()
-		:	Value(0)
-	{}
-
-	bool operator==(const Penny& v) const {
-		return OutPoint == v.OutPoint && Value == v.Value;
-	}
-
-	int64_t get_Debit() const;
-	DEFPROP_GET(int64_t, Debit);
-
-	bool get_IsFromMe() const { return Debit > 0; }
-	DEFPROP_GET(bool, IsFromMe);
-
-	size_t GetHashCode() const {
-		return hash<Coin::OutPoint>()(OutPoint);
-	}
-};
-
-EXT_DEF_HASH_NS(Coin, Penny);
 
 
 /*!!!
@@ -95,9 +66,9 @@ extern EXT_THREAD_PTR(Wallet) t_pWallet;
 class RescanThread : public Thread {
 	typedef Thread base;
 public:
+	HashValue m_hashFrom;
 	Coin::Wallet& Wallet;
 	int64_t m_i, m_count;
-	HashValue m_hashFrom;
 
 	RescanThread(Coin::Wallet& wallet, const HashValue& hashFrom);
 protected:
@@ -107,10 +78,10 @@ protected:
 class CompactThread : public Thread {
 	typedef Thread base;
 public:
+	HashValue m_hashFrom;
 	Coin::Wallet& Wallet;
 	atomic<int> m_ai;
 	uint32_t m_count;
-	HashValue m_hashFrom;
 
 	CompactThread(Coin::Wallet& wallet);
 protected:
@@ -120,23 +91,32 @@ protected:
 class COIN_CLASS Wallet : public WalletBase {
 	typedef Wallet class_type;
 	typedef WalletBase base;
+
+	DateTime m_dtNextResend;
+	DateTime m_dtLastResend;
+
+	mutex m_mtxMyTxHashes;
+	unordered_set<HashValue> m_myTxHashes;
+	//----
 public:
 	recursive_mutex Mtx;
 	HashValue BestBlockHash;
 
 	typedef unordered_map<OutPoint, TxOut> COutPointToTxOut;
 	COutPointToTxOut OutPointToTxOut;
-	ptr<Coin::RescanThread> RescanThread;
-	ptr<Coin::CompactThread> CompactThread;
+	ptr<RescanThread> ThreadRescan;
+	ptr<CompactThread> ThreadCompact;
 	vector<ptr<Alert>> Alerts;
 	ptr<CoinEng> m_peng;
 
 	mutex MtxCurrentHeight;
 	int CurrentHeight;
+	//----
 
 	int32_t m_dbNetId;
 	float Progress;
 	CBool m_bLoaded;
+	CBool m_bMiningEnabled;
 
 	Wallet(CoinEng& eng);
 	Wallet(CoinDb& cdb, RCString name);
@@ -146,8 +126,8 @@ public:
 	void Start();
 	void Stop();
 
-	vector<Address> get_MyAddresses();
-	DEFPROP_GET(vector<Address>, MyAddresses);
+	unordered_set<Address> get_MyAddresses();
+	DEFPROP_GET(unordered_set<Address>, MyAddresses);
 
 	vector<Address> get_Recipients();
 	DEFPROP_GET(vector<Address>, Recipients);
@@ -161,8 +141,6 @@ public:
 
 	decimal64 GetDecimalFee(const WalletTx& wtx);
 
-	CBool m_bMiningEnabled;
-
 	bool get_MiningEnabled() { return m_bMiningEnabled; }
 
 	void put_MiningEnabled(bool b);
@@ -170,11 +148,11 @@ public:
 
 	void SetAddressComment(const Address& addr, RCString comment);
 	decimal64 CalcFee(const decimal64& amount);
-	void SendTo(const decimal64& decAmount, RCString saddr, RCString comment);
+	void SendTo(const decimal64& decAmount, RCString saddr, RCString comment, const decimal64& decFee);
 	void Rescan();
 	void Close();
 //!!!	CngKey GetKey(const HashValue160& keyHash);
-	pair<WalletTx, decimal64> CreateTransaction(const KeyInfo& randomKey, const vector<pair<Address, int64_t>>& vSend);															// returns Fee
+	pair<WalletTx, decimal64> CreateTransaction(const KeyInfo& randomKey, const vector<pair<Address, int64_t>>& vSend, int64_t initialFee = 0);		// returns Fee
 	void Relay(const WalletTx& wtx);
 	int64_t Add(WalletTx& wtx, bool bPending);
 	void Commit(WalletTx& wtx);
@@ -191,9 +169,7 @@ public:
 			m_iiWalletEvents->OnStateChanged();
 	}
 protected:
-	pair<CanonicalPubKey, HashValue160> GetReservedPublicKey() override;
-
-	void OnProcessBlock(const Block& block) override;
+	void OnProcessBlock(const BlockHeader& block) override;
 	void OnProcessTx(const Tx& tx) override;
 	void OnEraseTx(const HashValue& hashTx) override;
 	void ProcessPendingTxes();
@@ -203,13 +179,6 @@ protected:
 	void OnPeriodicForLink(Link& link) override;
 
 private:
-	String DbFilePath;
-	DateTime m_dtNextResend;
-	DateTime m_dtLastResend;
-
-	mutex m_mtxMyTxHashes;
-	unordered_set<HashValue> m_myTxHashes;
-
 	void Init();
 	void StartRescan(const HashValue& hashFrom = HashValue::Null());
 	void TryRescanStep();
@@ -221,7 +190,7 @@ private:
 //!!!R	void SaveBlockords();
 	WalletTx GetTx(const HashValue& hashTx);
 	bool SelectCoins(uint64_t amount, uint64_t fee, int nConfMine, int nConfTheirs, pair<unordered_set<Penny>, uint64_t>& pp);
-	pair<unordered_set<Penny>, uint64_t> SelectCoins(uint64_t amount, uint64_t fee);			// <returns Pennies, RequiredFee>
+	pair<vector<Penny>, uint64_t> SelectCoins(uint64_t amount, uint64_t fee);			// <returns Pennies, RequiredFee>
 	bool ProcessTx(const Tx& tx);
 	void SetBestBlockHash(const HashValue& hash);
 	void ReacceptWalletTxes();

@@ -24,14 +24,17 @@ class MessageClassFactoryBase {
 public:
 	static unordered_map<String, MFN_CreateMessage> s_map;
 
-	MessageClassFactoryBase(const char *name, MFN_CreateMessage mfn) {
-		s_map.insert(make_pair(String(name), mfn));
-	}
+	MessageClassFactoryBase(const char* name, MFN_CreateMessage mfn);
 
 //!!!	virtual CoinMessage *CreateObject() { return new CoinMessage; }
 };
 
 unordered_map<String, MFN_CreateMessage> MessageClassFactoryBase::s_map;
+
+MessageClassFactoryBase::MessageClassFactoryBase(const char* name, MFN_CreateMessage mfn) {
+	s_map.insert(make_pair(String(name), mfn));
+}
+
 
 /*!!!
 template <class T>
@@ -269,7 +272,7 @@ void CoinMessage::ProcessMsg(P2P::Link& link) {
 VersionMessage::VersionMessage()
 	: base("version")
 	, ProtocolVer(Eng().ChainParams.ProtocolVersion)
-	, Services(0)
+	, Services(NodeServices::NODE_WITNESS | NodeServices::NODE_BLOOM)
 	, LastReceivedBlock(-1)
 	, RelayTxes(true)
 {
@@ -277,7 +280,7 @@ VersionMessage::VersionMessage()
 	if (eng.Mode == EngMode::Lite)
 		RelayTxes = !eng.Filter;
 	else
-		Services |= NodeServices::NODE_NETWORK | NodeServices::NODE_WITNESS;
+		Services |= NodeServices::NODE_NETWORK;
 }
 
 void VersionMessage::Write(ProtocolWriter& wr) const {
@@ -404,25 +407,25 @@ int LocatorHashes::FindHeightInMainChain(bool bFullBlocks) const {
 
 void BlockObj::WriteHeaderInMessage(ProtocolWriter& wr) const {
 	WriteHeader(wr);
-	CoinSerialized::WriteVarUInt64(wr, 0);
+	CoinSerialized::WriteCompactSize(wr, 0);
 }
 
 void BlockObj::ReadHeaderInMessage(const ProtocolReader& rd) {
 	ReadHeader(rd, false, 0);
-	CoinSerialized::ReadVarUInt64(rd);		// tx count unused
+	CoinSerialized::ReadCompactSize64(rd);		// tx count unused
 }
 
 void HeadersMessage::Write(ProtocolWriter& wr) const {
-	CoinSerialized::WriteVarUInt64(wr, Headers.size());
+	CoinSerialized::WriteCompactSize(wr, Headers.size());
 	EXT_FOR (const BlockHeader& header, Headers) {
-		header.m_pimpl->WriteHeaderInMessage(wr);
+		header->WriteHeaderInMessage(wr);
 	}
 }
 
 void HeadersMessage::Read(const ProtocolReader& rd) {
 	CoinEng& eng = Eng();
 
-	Headers.resize(CoinSerialized::ReadVarSize(rd));
+	Headers.resize(CoinSerialized::ReadCompactSize(rd));
 	for (int i = 0; i < Headers.size(); ++i) {
 		(Headers[i] = BlockHeader(eng.CreateBlockObj()))->ReadHeaderInMessage(rd);
 	}
@@ -502,7 +505,7 @@ void GetHeadersMessage::Process(Link& link) {
 	if (!Locators.empty())
 		m->Headers = eng.Db->GetBlockHeaders(Locators, HashStop);
 	else if (BlockHeader header = eng.Tree.FindHeader(HashStop)) {
-		if (header.IsInMainChain())
+		if (header.IsInTrunk())
 			m->Headers.push_back(header);
 	}
 	if (!m->Headers.empty())
@@ -537,7 +540,7 @@ void Inventory::Print(ostream& os) const {
 }
 
 GetBlocksMessage::GetBlocksMessage(const HashValue& hashLast, const HashValue& hashStop)
-	:	base("getblocks")
+	: base("getblocks")
 {
 	Set(hashLast, hashStop);
 }
@@ -594,7 +597,7 @@ void AlertMessage::Process(Link& link) {
 
 	HashValue hv = Hash(Payload);
 	EXT_FOR(const Blob& pubKey, eng.ChainParams.AlertPubKeys) {
-		if (KeyInfoBase::VerifyHash(pubKey, hv, Signature))
+		if (eng.VerifyHash(pubKey, hv, Signature))
 			goto LAB_VERIFIED;
 	}
 	Throw(CoinErr::AlertVerifySignatureFailed);
@@ -840,7 +843,7 @@ vector<Tx> MerkleBlockMessage::Init(const Coin::Block& block, CoinFilter& filter
 }
 
 void MerkleBlockMessage::Write(ProtocolWriter& wr) const {
-	Block.m_pimpl->WriteHeader(wr);
+	Block->WriteHeader(wr);
 	wr << uint32_t(PartialMT.NItems);
 	CoinSerialized::Write(wr, PartialMT.Items);
 	vector<uint8_t> v;
@@ -849,8 +852,8 @@ void MerkleBlockMessage::Write(ProtocolWriter& wr) const {
 }
 
 void MerkleBlockMessage::Read(const ProtocolReader& rd) {
-	Block.m_pimpl->ReadHeader(rd, false, 0);
-	Block.m_pimpl->m_bTxesLoaded = true;
+	Block->ReadHeader(rd, false, 0);
+	Block->m_bTxesLoaded = true;
 	PartialMT.NItems = rd.ReadUInt32();
 	CoinSerialized::Read(rd, PartialMT.Items);
 	Blob blob = CoinSerialized::ReadBlob(rd);
@@ -915,9 +918,9 @@ void CoinEng::RemoveVerNonce(Link& link) {
 }
 
 JumpAction CoinEng::TryJumpToBlockchain(int sym, Link *link) {
-	String symbol = MulticharToString(sym);
+	String symbol = Convert::MulticharToString(sym);
 	if (symbol == ChainParams.Symbol)
-		return JumpAction::Continue;	
+		return JumpAction::Continue;
 	TRC(2, symbol);
 	if (!link)
 		return JumpAction::Break;
@@ -1050,12 +1053,12 @@ void FeeFilterMessage::Process(Link& link) {
 }
 
 ProtocolWriter& operator<<(ProtocolWriter& wr, const CompactSize& cs) {
-    CoinSerialized::WriteVarUInt64(wr, cs);
+    CoinSerialized::WriteCompactSize(wr, cs);
     return wr;
 }
 
 const ProtocolReader& operator>>(const ProtocolReader& rd, CompactSize& cs) {
-    auto v = CoinSerialized::ReadVarUInt64(rd);
+    auto v = CoinSerialized::ReadCompactSize64(rd);
     if (v > UINT16_MAX)
         Throw(ExtErr::Protocol_Violation);
     cs = CompactSize((uint16_t)v);
@@ -1115,10 +1118,10 @@ void CompactBlockMessage::Write(ProtocolWriter& wr) const {
     wr << Nonce;
     CoinSerialized::Write(wr, ShortTxIds);
 
-    CoinSerialized::WriteVarUInt64(wr, PrefilledTxes.size());
+    CoinSerialized::WriteCompactSize(wr, PrefilledTxes.size());
     uint16_t prev = uint16_t(-1);
     for (auto& pp : PrefilledTxes) {
-        CoinSerialized::WriteVarUInt64(wr, pp.first - exchange(prev, pp.first) - 1);
+        CoinSerialized::WriteCompactSize(wr, pp.first - exchange(prev, pp.first) - 1);
         pp.second.Write(wr);
     }
 }
@@ -1131,12 +1134,12 @@ void CompactBlockMessage::Read(const ProtocolReader& rd) {
     rd >> Nonce;
     CoinSerialized::Read(rd, ShortTxIds);
 
-    auto size = CoinSerialized::ReadVarUInt64(rd);
+    auto size = CoinSerialized::ReadCompactSize64(rd);
     if (size > UINT16_MAX)
         Throw(ExtErr::Protocol_Violation);
     PrefilledTxes.resize((size_t)size);
     for (size_t i = 0; i < PrefilledTxes.size(); ++i) {
-        auto off = CoinSerialized::ReadVarUInt64(rd);
+        auto off = CoinSerialized::ReadCompactSize64(rd);
         auto idx = off + (i ? PrefilledTxes[i - 1].first + 1 : 0);
         if (off > UINT16_MAX || idx > UINT16_MAX)
             Throw(ExtErr::Protocol_Violation);
@@ -1167,20 +1170,20 @@ void CompactBlockMessage::Process(Link& link) {
 
 void GetBlockTransactionsMessage::Write(ProtocolWriter& wr) const {
     wr << HashBlock;
-    CoinSerialized::WriteVarUInt64(wr, Indexes.size());
+    CoinSerialized::WriteCompactSize(wr, Indexes.size());
     uint16_t prev = uint16_t(-1);
     for (auto idx : Indexes)
-        CoinSerialized::WriteVarUInt64(wr, idx - exchange(prev, idx) - 1);
+        CoinSerialized::WriteCompactSize(wr, idx - exchange(prev, idx) - 1);
 }
 
 void GetBlockTransactionsMessage::Read(const ProtocolReader& rd) {
     rd >> HashBlock;
-    auto n = CoinSerialized::ReadVarUInt64(rd);
+    auto n = CoinSerialized::ReadCompactSize64(rd);
     if (n > UINT16_MAX)
         Throw(ExtErr::Protocol_Violation);
     Indexes.resize(n);
     for (size_t i = 0; i < n; ++i) {
-        auto off = CoinSerialized::ReadVarUInt64(rd);
+        auto off = CoinSerialized::ReadCompactSize64(rd);
         auto idx = off + (i ? Indexes[i - 1] + 1 : 0);
         if (off > UINT16_MAX || idx > UINT16_MAX)
             Throw(ExtErr::Protocol_Violation);

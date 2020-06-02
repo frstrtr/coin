@@ -14,6 +14,13 @@ BlockTreeItem::BlockTreeItem(const BlockHeader& header)
 {
 }
 
+void BlockTree::Clear() {
+	HeightLastCheckpointed = -1;
+	EXT_LOCK(Mtx) {
+		Map.clear();
+	}
+}
+
 BlockTreeItem BlockTree::FindInMap(const HashValue& hashBlock) const {
 	return EXT_LOCKED(Mtx, Lookup(Map, hashBlock).value_or(BlockTreeItem()));
 }
@@ -21,7 +28,13 @@ BlockTreeItem BlockTree::FindInMap(const HashValue& hashBlock) const {
 BlockHeader BlockTree::FindHeader(const HashValue& hashBlock) const {
 	if (BlockTreeItem item = FindInMap(hashBlock))
 		return item;
-	return Eng().Db->FindHeader(hashBlock);
+	return Eng.Db->FindHeader(hashBlock);
+}
+
+BlockHeader BlockTree::FindHeader(const BlockRef& bref) const {
+	if (BlockTreeItem item = FindInMap(bref.Hash))
+		return item;
+	return Eng.Db->FindHeader(bref);
 }
 
 BlockTreeItem BlockTree::GetHeader(const HashValue& hashBlock) const {
@@ -30,12 +43,18 @@ BlockTreeItem BlockTree::GetHeader(const HashValue& hashBlock) const {
 	Throw(E_FAIL);
 }
 
+BlockTreeItem BlockTree::GetHeader(const BlockRef& bref) const {
+	if (BlockTreeItem item = FindHeader(bref))
+		return item;
+	Throw(E_FAIL);
+}
+
 Block BlockTree::FindBlock(const HashValue& hashBlock) const {
 	if (BlockTreeItem item = FindInMap(hashBlock)) {
-		if (!item.IsHeaderOnly)
+		if (!item->IsHeaderOnly())
 			return Block(item.m_pimpl);
 	}
-	return Eng().LookupBlock(hashBlock);
+	return Eng.LookupBlock(hashBlock);
 }
 
 Block BlockTree::GetBlock(const HashValue& hashBlock) const {
@@ -45,14 +64,13 @@ Block BlockTree::GetBlock(const HashValue& hashBlock) const {
 }
 
 BlockHeader BlockTree::GetAncestor(const HashValue& hashBlock, int height) const {
-	CoinEng& eng = Eng();
 	BlockTreeItem item = GetHeader(hashBlock);
 	if (height == item.Height)
 		return item;
 	if (height > item.Height)
 		return BlockHeader(nullptr);
 	EXT_LOCK(Mtx) {
-		while (height < item.Height-1) {
+		while (height < item.Height - 1) {
 			if (auto o = Lookup(Map, item.PrevBlockHash))
 				item = o.value();
 			else
@@ -61,7 +79,7 @@ BlockHeader BlockTree::GetAncestor(const HashValue& hashBlock, int height) const
 	}
 	return GetHeader(item.PrevBlockHash);
 LAB_TRY_MAIN_CHAIN:
-	return eng.Db->FindHeader(height);
+	return Eng.Db->FindHeader(height);
 }
 
 BlockHeader BlockTree::LastCommonAncestor(const HashValue& ha, const HashValue& hb) const {
@@ -79,7 +97,7 @@ vector<Block> BlockTree::FindNextBlocks(const HashValue& hashBlock) const {
 	vector<Block> r;
 	EXT_LOCK(Mtx) {
 		EXT_FOR(CMap::value_type pp, Map) {
-			if (pp.second.PrevBlockHash == hashBlock && !pp.second.IsHeaderOnly)
+			if (pp.second.PrevBlockHash == hashBlock && !pp.second->IsHeaderOnly())
 				r.push_back(Block(pp.second.m_pimpl));
 		}
 	}

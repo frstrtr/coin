@@ -56,6 +56,7 @@ void ChainParams::Init() {
 	IsTestNet = false;
 	HashAlgo = Coin::HashAlgo::Sha256;
 	ProtocolVersion = ProtocolVersion::PROTOCOL_VERSION;
+	DiskMagic = 0;
 	AuxPowStartBlock = INT_MAX;
 	CoinValue = 100000000;
 	InitBlockValue = CoinValue * 50;
@@ -69,7 +70,8 @@ void ChainParams::Init() {
 	MinTxOutAmount = 0;
 	MaxPossibleTarget = Target(0x1D7FFFFF);
 	InitTarget = MaxPossibleTarget;
-	CoinbaseMaturity = 100;
+	CoinbaseMaturity = COINBASE_MATURITY;
+	MaxBlockWeight = MAX_BLOCK_WEIGHT;
 	PowOfDifficultyToHalfSubsidy = 1;
 	PayToScriptHashHeight = numeric_limits<int>::max();
 	BIP34Height = BIP65Height = BIP66Height = BIP68Height = SegwitHeight = 0;
@@ -83,7 +85,7 @@ void ChainParams::Init() {
 
 Blob EncryptedPrivKey(BuggyAes& aes, const KeyInfo& key) {
 	uint8_t typ = DEFAULT_PASSWORD_ENCRYPT_METHOD;
-	Blob privKey = key.PrivKey;
+	const PrivateKey& privKey = key.PrivKey;
 	return Blob(&typ, 1) + aes.Encrypt(privKey + Crc32().ComputeHash(privKey));
 }
 
@@ -105,7 +107,7 @@ void EngEvents::OnBestBlock(const Block& block) {
 		s->OnBestBlock(block);
 }
 
-void EngEvents::OnProcessBlock(const Block& block) {
+void EngEvents::OnProcessBlock(const BlockHeader& block) {
 	for (auto& s : Subscribers)
 		s->OnProcessBlock(block);
 }
@@ -214,6 +216,7 @@ CCoinEngThreadKeeper::~CCoinEngThreadKeeper() {
 
 CoinEng::CoinEng(CoinDb& cdb)
 	: base(cdb)
+	, Tree(_self)
 	, TxPool(*this)
 	, m_cdb(cdb)
 	, MaxBlockVersion(3)
@@ -223,10 +226,12 @@ CoinEng::CoinEng(CoinDb& cdb)
 	, m_mode(EngMode::Normal)
 	, AllowFreeTxes(true)
 	, UpgradingDatabaseHeight(0)
+	, Rescanning(false)
 	, OffsetInBootstrap(0)
 	, NextOffsetInBootstrap(0)
 	, aPreferredDownloadPeers(0)
 	, aSyncStartedPeers(0)
+	, MaxOpcode(Opcode::OP_NOP10)
 {
 	StallingTimeout = BLOCK_STALLING_TIMEOUT;
 }
@@ -272,6 +277,10 @@ String CoinEng::BlockStringId(const HashValue& hashBlock) {
 
 HashValue CoinEng::HashMessage(RCSpan cbuf) {
 	return Coin::Hash(cbuf);
+}
+
+HashValue CoinEng::HashForWallet(RCSpan s) {
+	return Coin::Hash(s);
 }
 
 HashValue CoinEng::HashForSignature(RCSpan cbuf) {
@@ -320,7 +329,7 @@ Block CoinEng::GetBlockByHeight(uint32_t height) {
 
 #ifdef X_DEBUG //!!!D
 	HashValue h1 = Hash(block);
-	block.m_pimpl->m_hash.reset();
+	block->m_hash.reset();
 	ASSERT(h1 == Hash(block));
 #endif
 
@@ -363,10 +372,13 @@ bool CoinEng::CreateDb() {
 	bool r = Db->Create(GetDbFilePath());
 	OffsetInBootstrap = 0;
 
+	if (Mode == EngMode::Lite) {
+		CoinEngTransactionScope scopeBlockSavepoint(_self);
+		Db->SetFilter(m_cdb.Filter);
+	}
+
 	TransactionScope dbtx(*Db);
-
 	Events.OnCreateDatabase();
-
 	return r;
 }
 
@@ -419,11 +431,13 @@ void ChainParams::LoadFromXmlAttributes(IXmlAttributeCollection& xml) {
 
 	a = xml.GetAttribute("MaxTargetHex");
 	MaxTarget = !a.empty() ? Target(Convert::ToUInt32(a, 16)) : Target(0x1D00FFFF);
+	HashValueMaxTarget = HashValue::FromDifficultyBits(MaxTarget.m_value);
 
 	if (!(a = xml.GetAttribute("InitTargetHex")).empty())
 		InitTarget = Target(Convert::ToUInt32(a, 16));
 
 	ProtocolMagic = Convert::ToUInt32(xml.GetAttribute("ProtocolMagicHex"), 16);
+	DiskMagic = (a = xml.GetAttribute("DiskMagicHex")).empty() ? ProtocolMagic : Convert::ToUInt32(a, 16);
 
 	if (!(a = xml.GetAttribute("ProtocolVersion")).empty())
 		ProtocolVersion = Convert::ToUInt32(a);
@@ -551,12 +565,13 @@ LAB_RET:
 		if (p->Name == name)
 			peng = p->CreateEng(cdb);
 	(peng ? peng : (peng = new CoinEng(cdb)))->SetChainParams(params);
-	peng->AddressVersion = peng->ChainParams.AddressVersion;
-	peng->ScriptAddressVersion = peng->ChainParams.ScriptAddressVersion;
-	peng->Hrp = peng->ChainParams.Hrp;
-	peng->ProtocolMagic = peng->ChainParams.ProtocolMagic;
-	peng->Listen = peng->ChainParams.Listen;
-	peng->DefaultPort = peng->ChainParams.DefaultPort;
+	const Coin::ChainParams& p = peng->ChainParams;
+	peng->AddressVersion = p.AddressVersion;
+	peng->ScriptAddressVersion = p.ScriptAddressVersion;
+	peng->Hrp = p.Hrp;
+	peng->ProtocolMagic = p.ProtocolMagic;
+	peng->Listen = p.Listen;
+	peng->DefaultPort = p.DefaultPort;
 	return peng;
 }
 
@@ -628,7 +643,7 @@ void CoinEng::SetBestHeader(const BlockHeader& bh) {
 	EXT_LOCKED(Caches.Mtx, Caches.m_bestHeader = bh);
 }
 
-Block CoinEng::BestBlock() {
+BlockHeader CoinEng::BestBlock() {
 	EXT_LOCK(Caches.Mtx) {
 		return Caches.m_bestBlock;
 	}
@@ -636,6 +651,14 @@ Block CoinEng::BestBlock() {
 
 int CoinEng::BestBlockHeight() {
 	return EXT_LOCKED(Caches.Mtx, Caches.m_bestBlock.SafeHeight);
+}
+
+void CoinEng::SetBestBlock(const BlockHeader& b) {
+	EXT_LOCK(Caches.Mtx) {
+		Caches.m_bestBlock = b;
+		if (b.SafeHeight > Caches.m_bestHeader.SafeHeight)
+			Caches.m_bestHeader = b;
+	}
 }
 
 void CoinEng::SetBestBlock(const Block& b) {
@@ -661,7 +684,8 @@ void CoinEng::put_Mode(EngMode mode) {
 	if (bRunned)
 		Stop();
 	SetBestHeader(nullptr);
-	SetBestBlock(nullptr);
+	SetBestBlock(Block(nullptr));
+	Tree.Clear();
 	m_mode = mode;
 	Filter = nullptr;
 	m_dbFilePath = "";
@@ -669,6 +693,7 @@ void CoinEng::put_Mode(EngMode mode) {
 		Load();
 		Start();
 	}
+	TRC(0, "Switched " << ChainParams.Symbol << " to " << (mode == EngMode::Lite ? "Lite" : "Bootstrap") << " mode");
 }
 
 void CoinEng::PurgeDatabase() {
@@ -677,7 +702,7 @@ void CoinEng::PurgeDatabase() {
 		Stop();
 	Db->Close(false);
 	SetBestHeader(nullptr);
-	SetBestBlock(nullptr);
+	SetBestBlock(Block(nullptr));
 	filesystem::remove(GetDbFilePath());
 	Filter = nullptr;
 	if (bRunned) {
@@ -944,6 +969,15 @@ void CoinEng::Push(const TxInfo& txInfo) {
 	}
 }
 
+void CoinEng::Broadcast(CoinMessage* m) {
+	EXT_LOCK(MtxPeers) {
+		for (auto& pLinkBase : Links) {			// early broadcast found Block
+			Link& link = static_cast<Link&>(*pLinkBase);
+			link.Send(m);
+		}
+	}
+}
+
 bool CoinEng::IsFromMe(const Tx& tx) {
 	return Events.IsFromMe(tx);
 }
@@ -953,7 +987,7 @@ void CoinEng::Relay(const TxInfo& txInfo) {
 
 	TRC(TRC_LEVEL_TX_MESSAGE, hash);
 
-	if (!txInfo.Tx.IsCoinBase() && !HaveTxInDb(hash)) {
+	if (!txInfo.Tx->IsCoinBase() && !HaveTxInDb(hash)) {
 		EXT_LOCKED(Caches.Mtx, Caches.m_relayHashToTx.insert(make_pair(hash, txInfo.Tx)));
 		Push(txInfo);
 	}
@@ -993,10 +1027,13 @@ CoinEngApp::CoinEngApp() {
 	TRC(0, "Starting");
 #endif
 	auto pathExampleConf = appDataDir / (UCFG_COIN_CONF_FILENAME ".example");
-	if (!exists(pathExampleConf)) {
+	ostringstream osExample;
+	osExample << "# Example Configuration file, you may rename it to " << UCFG_COIN_CONF_FILENAME << ", uncomment some options and edit them\n\n";
+	g_conf.SaveSample(osExample);
+	String sExample = osExample.str();
+	if (!exists(pathExampleConf) || file_size(pathExampleConf) != sExample.length()) {
 		ofstream ofs(pathExampleConf);
-		ofs << "# Example Configuration file, you may rename it to " << UCFG_COIN_CONF_FILENAME << ", uncomment some options and edit them\n\n";
-		g_conf.SaveSample(ofs);
+		ofs << sExample;
 	}
 	if (ifstream ifs = ifstream(appDataDir / UCFG_COIN_CONF_FILENAME))
 		g_conf.Load(ifs);
@@ -1026,7 +1063,7 @@ Version CoinEngApp::get_ProductVersion() {
 CoinEngApp theApp;
 
 void SetUserVersion(SqliteConnection& db, const Version& ver) {
-	Version v = ver == Version() ? theApp.ProductVersion : ver;
+	Version v = ver == Version() ? DB_VER_LATEST : ver;
 	db.ExecuteNonQuery(EXT_STR("PRAGMA user_version = " << ((v.Major << 16) | v.Minor)));
 }
 
@@ -1055,17 +1092,14 @@ path CoinEng::GetBootstrapPath() {
 }
 
 path CoinEng::VGetDbFilePath() {
-	path r = AfxGetCApp()->get_AppDataDir() / ToPath(ChainParams.Name);
-	if (!m_cdb.FilenameSuffix.empty())
-		r += m_cdb.FilenameSuffix.c_str();
-	else {
-		switch (Mode) {
-		case EngMode::Lite: r += ".spv"; break;
-		case EngMode::BlockParser: r += ".blocks"; break;
-		case EngMode::BlockExplorer: r = AfxGetCApp()->get_AppDataDir() / ToPath(ChainParams.Symbol) / ToPath(ChainParams.Symbol + ".explorer"); break;
-		case EngMode::Bootstrap: r = AfxGetCApp()->get_AppDataDir() / ToPath(ChainParams.Symbol) / ToPath(ChainParams.Symbol + ".bootstrap-index"); break;
-		}
+	String suffix = ".normal";
+	switch (Mode) {
+	case EngMode::Lite: suffix = ".spv"; break;
+	case EngMode::BlockParser: suffix = ".blocks"; break;
+	case EngMode::BlockExplorer: suffix = ".explorer"; break;
+	case EngMode::Bootstrap: suffix = ".bootstrap-index"; break;
 	}
+	path r = AfxGetCApp()->get_AppDataDir() / ToPath(ChainParams.Symbol) / ToPath(ChainParams.Symbol + suffix);
 	return r;
 }
 
@@ -1197,10 +1231,26 @@ void CoinEng::Start() {
 	if (Runned)
 		return;
 
-	EXT_LOCKED(m_cdb.MtxDb, Filter = Mode == EngMode::Lite ? m_cdb.Filter : nullptr);
+	EXT_LOCK(m_cdb.MtxDb) {
+		if (Mode != EngMode::Lite)
+			Filter = nullptr;
+		else {
+			Filter = Db->GetFilter();
+			if (!m_cdb.IsFilterValid(Filter)) {
+				PurgeDatabase();
+				Load();
+				CoinEngTransactionScope scopeBlockSavepoint(_self);
+				Db->SetFilter(m_cdb.Filter);
+			}
+		}
+		m_cdb.Events += this;
+	}
 
 	Net::Start();
-	EXT_LOCKED(m_cdb.MtxNets, m_cdb.m_nets.push_back(this));
+	EXT_LOCK(m_cdb.MtxNets) {
+		m_cdb.m_nets.push_back(this);
+		m_cdb.Events += this;
+	}
 	m_cdb.Start();
 
 	TryStartBootstrap();
@@ -1208,6 +1258,19 @@ void CoinEng::Start() {
 
 	if (g_conf.Connect.empty())	   // Don't use seeds when we have "connect=" option
 		AddSeeds();
+}
+
+void CoinEng::OnFilterChanged() {		// under m_cdb.MtxDb
+	if (Mode != EngMode::Lite)
+		return;
+	ptr<FilterLoadMessage> m;
+	if (Mode == EngMode::Lite) {
+		CoinEngTransactionScope scopeBlockSavepoint(_self);
+		Db->SetFilter(Filter = m_cdb.Filter);
+		m = new FilterLoadMessage(Filter.get());
+	}
+	if (m)
+		Broadcast(m);
 }
 
 void CoinEng::SignalStop() {
@@ -1221,6 +1284,7 @@ void CoinEng::Stop() {
 	if (Runned)
 		SignalStop();
 	EXT_LOCK(m_cdb.MtxNets) {
+		m_cdb.Events -= this;
 		Ext::Remove(m_cdb.m_nets, this);
 	}
 #if UCFG_COIN_USE_IRC
@@ -1261,15 +1325,19 @@ void GetDataMessage::Process(Link& link) {
 			}
 
 			if (Block block = eng.Tree.FindBlock(inv.HashValue)) {
-				//		ASSERT(EXT_LOCKED(eng.Mtx, (block.m_pimpl->m_hash.reset(), Hash(block)==inv.HashValue)));
+				//		ASSERT(EXT_LOCKED(eng.Mtx, (block->m_hash.reset(), Hash(block)==inv.HashValue)));
 
-				if (inv.Type == InventoryType::MSG_BLOCK || inv.Type == InventoryType::MSG_WITNESS_BLOCK) {
+				switch (inv.Type) {
+				case InventoryType::MSG_BLOCK:
+				case InventoryType::MSG_WITNESS_BLOCK: {
 					TRC(2, "Block Message sending");
 
 					ptr<BlockMessage> m = new BlockMessage(block);
 					m->WitnessAware = bool(inv.Type & InventoryType::MSG_WITNESS_FLAG);
 					link.Send(m);
-				} else {
+				} break;
+				case InventoryType::MSG_FILTERED_BLOCK:
+				case InventoryType::MSG_FILTERED_WITNESS_BLOCK: {
 					ptr<MerkleBlockMessage> mbm;
 					vector<Tx> matchedTxes = EXT_LOCKED(link.MtxFilter, link.Filter ? (mbm = new MerkleBlockMessage)->Init(block, *link.Filter) : vector<Tx>());
 					if (mbm) {
@@ -1279,10 +1347,10 @@ void GetDataMessage::Process(Link& link) {
 								if (link.KnownInvertorySet.count(Inventory(InventoryType::MSG_TX, Hash(matchedTxes[i]))))
 									matchedTxes.erase(matchedTxes.begin() + i);
 						}
-						EXT_FOR(const Tx& tx, matchedTxes) {
+						for (auto& tx : matchedTxes)
 							link.Send(new TxMessage(tx));
-						}
 					}
+				} break;
 				}
 
 				if (inv.HashValue == link.HashContinue) {
@@ -1389,15 +1457,12 @@ void IBlockChainDb::UpdateCoins(const OutPoint& op, bool bSpend, int32_t heightC
 }
 
 Version CheckUserVersion(SqliteConnection& db) {
-	Version ver = theApp.ProductVersion;
-	SqliteCommand cmd("PRAGMA user_version", db);
-	int dbver = (int)cmd.ExecuteInt64Scalar();
+	int dbver = (int)SqliteCommand("PRAGMA user_version", db).ExecuteInt64Scalar();
 	Version dver = Version(dbver >> 16, dbver & 0xFFFF);
-	if (dver > ver && (dver.Major != ver.Major || dver.Minor / 10 != ver.Minor / 10)) { // Versions [mj.x0 .. mj.x9] are DB-compatible
-		db.Close();
-		throw VersionException(dver);
-	}
-	return dver;
+	if (dver.Major <= DB_VER_LATEST.Major)	// Version mj.x is compatible with mj.y
+		return dver;
+	db.Close();
+	throw VersionException(dver);
 }
 
 CEngStateDescription::CEngStateDescription(CoinEng& eng, RCString s)

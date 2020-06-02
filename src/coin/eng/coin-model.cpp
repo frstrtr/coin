@@ -11,7 +11,6 @@
 #include <el/crypto/ecdsa.h>
 using namespace Ext::Crypto;
 
-#include "coin-model.h"
 #include "eng.h"
 #include "coin-protocol.h"
 #include "script.h"
@@ -52,23 +51,13 @@ HashValue Hash(const CPersistent& pers) {
 }
 
 HashValue Hash(const Tx& tx) {
-#ifdef X_DEBUG //!!!D
-	if (tx.m_pimpl->m_hash && tx.m_pimpl->m_hash != Hash(EXT_BIN(tx))) {
-		HashValue hv = Hash(EXT_BIN(tx));
-		MemoryStream ms;
-		BinaryWriter wr(ms);
-		wr << tx;
-		hv = hv;
-	}
-	ASSERT(tx.m_pimpl->m_nBytesOfHash != 32 || tx.m_pimpl->m_hash == Hash(EXT_BIN(tx)));
-#endif
-	if (tx.m_pimpl->m_nBytesOfHash != 32)
+	if (tx->m_nBytesOfHash != 32)
 		tx.SetHash(Eng().HashFromTx(tx));
-	return tx.m_pimpl->m_hash;
+	return tx->m_hash;
 }
 
 HashValue WitnessHash(const Tx& tx) {
-    return tx.m_pimpl->HasWitness() ? Eng().WitnessHashFromTx(tx) : Hash(tx);
+    return tx->HasWitness() ? Eng().WitnessHashFromTx(tx) : Hash(tx);
 }
 
 void MerkleTx::Write(ProtocolWriter& wr) const {
@@ -155,39 +144,6 @@ void AuxPow::Check(const Block& blockAux) {
 		Throw(CoinErr::AUXPOW_WrongIndex);
 }
 
-PrivateKey::PrivateKey(RCString s) {
-	try {
-		Blob blob = ConvertFromBase58(s.Trim());
-		if (blob.size() < 10)
-			Throw(CoinErr::InvalidAddress);
-		uint8_t ver = blob.constData()[0];
-		//!!! common ver for all Nets		if (ver != Eng().ChainParams.AddressVersion+128)
-		if (!(ver & 128))
-			Throw(CoinErr::InvalidAddress);
-		m_data = CData(blob.constData() + 1, blob.size() - 1);
-	} catch (RCExc) {
-		Throw(CoinErr::InvalidAddress);
-	}
-}
-
-PrivateKey::PrivateKey(RCSpan cbuf, bool bCompressed)
-{
-	if (cbuf.size() > 33)
-		Throw(E_INVALIDARG);
-	m_data = vararray<uint8_t, 33>(cbuf.data(), cbuf.size());
-	if (bCompressed) {
-		if (m_data.size() >= 33)
-			Throw(E_INVALIDARG);
-		m_data.push_back(1);
-	}
-}
-
-String PrivateKey::ToString() const {
-	uint8_t ver = 128; //!!!  for all nets, because Private Keys are common // Eng().ChainParams.AddressVersion+128;
-	Blob blob = Span(&ver, 1) + m_data;
-	return ConvertToBase58(blob);
-}
-
 ChainCaches::ChainCaches()
 	: m_bestHeader(nullptr)
 	, m_bestBlock(nullptr)
@@ -197,6 +153,14 @@ ChainCaches::ChainCaches()
 	, m_cachePkIdToPubKey(4096) // should be more than usual value (Txes per Block)
 	, PubkeyCacheEnabled(true)
 	, OrphanBlocks(BLOCK_DOWNLOAD_WINDOW) {
+}
+
+void ChainCaches::Add(const SpentTx& stx) {
+	EXT_LOCK(Mtx) {
+		m_cacheSpentTxes.push_front(stx);
+		if (m_cacheSpentTxes.size() > MAX_LAST_SPENT_TXES)
+			m_cacheSpentTxes.pop_back();
+	}
 }
 
 } // namespace Coin

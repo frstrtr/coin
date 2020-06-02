@@ -15,7 +15,7 @@ using namespace Ext::DB::KV;
 namespace Coin {
 
 const size_t BLOCKID_SIZE = 3;
-const size_t TXID_SIZE = 6;
+const size_t TXID_SIZE = 6;				// Probability of collision 1/16M
 const size_t PUBKEYID_SIZE = 5;
 const size_t PUBKEYTOTXES_ID_SIZE = 8;
 
@@ -71,13 +71,12 @@ public:
 	BlockKey(RCSpan cbuf)
 		: m_beH(0)
 	{
-		memcpy((uint8_t*)&m_beH + 1, cbuf.data(), BLOCKID_SIZE);
+		memcpy((uint8_t*)& m_beH + 1, cbuf.data(), BLOCKID_SIZE);
 	}
 
 	operator uint32_t() const { return betoh(m_beH); }
-	operator Span() const { return Span((const uint8_t*)&m_beH + 1, BLOCKID_SIZE); }
+	operator Span() const { return Span((const uint8_t*)& m_beH + 1, BLOCKID_SIZE); }
 };
-
 
 class DbliteBlockChainDb : public IBlockChainDb {
 	typedef IBlockChainDb base;
@@ -87,6 +86,7 @@ class DbliteBlockChainDb : public IBlockChainDb {
 	File m_fileBootstrap;
 	MemoryMappedFile m_mmBootstrap;
 	MemoryMappedView m_viewBootstrap;
+	vector<uint64_t> BlockOffsets;		// Cached offset, not modified on DeleteBlock() because txes never reference on deleted blocks
 	uint64_t MappedSize;
 public:
 	CoinEng& Eng;
@@ -114,17 +114,20 @@ public:
 	int FindHeight(const HashValue& hash) override;
 	BlockHeader FindHeader(int height) override;
 	BlockHeader FindHeader(const HashValue& hash) override;
+	BlockHeader FindHeader(const BlockRef& bref) override;
 	optional<pair<uint64_t, uint32_t>> FindBlockOffset(const HashValue& hash) override;
 	Block FindBlock(const HashValue& hash) override;
 	Block FindBlock(int height) override;
 	Block FindBlockPrefixSuffix(int height) override;
+	int FindHeightByOffset(uint64_t offset);
 	int GetMaxHeight() override;
 	int GetMaxHeaderHeight() override;
 	TxHashesOutNums GetTxHashesOutNums(int height) override;
 	pair<OutPoint, TxOut> GetOutPointTxOut(int height, int idxOut) override;
 	void SpendInputs(const Tx& tx);
 
-	struct TxData {
+	class TxData {
+	public:
 		HashValue HashTx;
 		Blob Data,
 			TxIns;
@@ -189,7 +192,7 @@ public:
 	void InsertSpentTxOffsets(const unordered_map<HashValue, SpentTx>& spentTxOffsets) override;
 
 	void InsertBlock(const Block& block, CConnectJob& job) override;
-	void InsertHeader(const BlockHeader& header) override;
+	void InsertHeader(const BlockHeader& header, bool bUpdateMaxHeight) override;
 
 	vector<bool> GetCoinsByTxHash(const HashValue& hash) override;
 	void SaveCoinsByTxHash(const HashValue& hash, const vector<bool>& vec) override;
@@ -203,6 +206,9 @@ public:
 	Blob FindPubkey(int64_t id) override;
 	void InsertPubkey(int64_t id, RCSpan pk) override;
 	void UpdatePubkey(int64_t id, RCSpan pk) override;
+
+	ptr<CoinFilter> GetFilter() override;
+	void SetFilter(CoinFilter* filter) override;
 
 	void BeginTransaction() override {
 //		ASSERT(!m_dbt.get());
@@ -247,4 +253,3 @@ private:
 
 
 } // Coin::
-

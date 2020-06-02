@@ -42,7 +42,7 @@ int64_t PosTxObj::GetCoinAge() const {
 				if (Timestamp < dtPrev)
 					Throw(CoinErr::TimestampViolation);
 				if (eng.GetBlockByHeight(txPrev.Height).get_Timestamp()+TimeSpan::FromDays(30) <= Timestamp)
-					centSecond += BigInteger(txPrev.TxOuts()[txIn.PrevOutPoint.Index].Value) * duration_cast<seconds>(Timestamp-dtPrev).count() / (eng.ChainParams.CoinValue/100);
+					centSecond += BigInteger(txPrev.TxOuts()[txIn.PrevOutPoint.Index].Value) * duration_cast<seconds>(Timestamp-dtPrev).count() / (eng.ChainParams.CoinValue / 100);
 			}
 			m_coinAge = explicit_cast<int64_t>(centSecond / (100 * 24*60*60));
 		}
@@ -165,7 +165,7 @@ void PosBlockObj::WriteKernelStakeModifierV05(DateTime dtTx, BinaryWriter& wr, c
 		Throw(CoinErr::CoinstakeCheckTargetFailed);
 	}
 	PosEng::StakeModifierItem item ={ blockPrev.Timestamp, PosBlockObj::Of(blockPrev).StakeModifier };
-	for (Block b=blockPrev; dt > dtCompare; b=eng.Tree.GetBlock(b.PrevBlockHash)) {
+	for (Block b = blockPrev; dt > dtCompare; b = eng.Tree.GetBlock(b.PrevBlockHash)) {
 		if (!!(item = eng.GetStakeModifierItem(b.Height-1)).StakeModifier)
 			dt = item.Timestamp;
 	}
@@ -219,7 +219,7 @@ HashValue PosBlockObj::HashProofOfStake() const {
 		MemoryStream msBlock;
 		ProtocolWriter wrPrev(msBlock);
 		blockPrev.WriteHeader(wrPrev);
-		CoinSerialized::WriteVarUInt64(wrPrev, blockPrev.get_Txes().size());
+		CoinSerialized::WriteCompactSize(wrPrev, blockPrev.get_Txes().size());
 		EXT_FOR (const Tx& t, blockPrev.get_Txes()) {
 			if (Coin::Hash(t) == txIn.PrevOutPoint.TxHash) {
 				wr << uint32_t(Span(msBlock).size());
@@ -483,4 +483,3 @@ int64_t PosEng::GetProofOfStakeReward(int64_t coinAge, const Target& target, con
 }
 
 } // Coin::
-

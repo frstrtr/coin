@@ -23,6 +23,7 @@ using namespace Ext::Inet;
 using P2P::Peer;
 
 #include "coin-model.h"
+#include "../util/opcode.h"
 
 #if UCFG_COIN_GENERATE
 #	include "../miner/miner.h"
@@ -50,16 +51,16 @@ class GetDataMessage;
 class Link;
 
 extern const Version
-VER_BLOCKS_TABLE_IS_HASHTABLE,
-VER_PUBKEY_RECOVER,
-VER_HEADERS,
-DB_VER_COMPACT_UTXO,
-DB_VER_LATEST;
+	VER_BLOCKS_TABLE_IS_HASHTABLE,
+	VER_PUBKEY_RECOVER,
+	VER_HEADERS,
+	DB_VER_COMPACT_UTXO,
+	DB_VER_LATEST;
 
 struct QueuedBlockItem {
-	Coin::Link& Link;
 	HashValue HashBlock;
 	DateTime DtGetdataReq;
+	Coin::Link& Link;
 
 	QueuedBlockItem(Coin::Link& link, const HashValue& hashBlock, const DateTime& dtGetdataReq) : Link(link), HashBlock(hashBlock), DtGetdataReq(dtGetdataReq) {}
 };
@@ -136,11 +137,15 @@ public:
 	int CoinbaseMaturity;
 	int AnnualPercentageRate;
 	int TargetInterval;
+
 	Target MaxTarget, InitTarget;
+	HashValue HashValueMaxTarget;		// function of MaxTarget
 	Target MaxPossibleTarget;
-	uint32_t ProtocolMagic;
+
+	uint32_t ProtocolMagic, DiskMagic;
 	uint32_t ProtocolVersion;
 	uint16_t DefaultPort;
+	unsigned MaxBlockWeight;
 	int IrcRange;
 	int PayToScriptHashHeight;
 	int CheckDupTxHeight;
@@ -194,7 +199,7 @@ interface IEngEvents {
 	virtual void OnCreateDatabase() {}
 	virtual void OnCloseDatabase() {}
 	virtual void OnBestBlock(const Block& block) {}
-	virtual void OnProcessBlock(const Block& block) {}
+	virtual void OnProcessBlock(const BlockHeader& block) {}
 	virtual void OnBlockConnectDbtx(const Block& block) {}
 	virtual void OnBeforeCommit() {}
 	virtual void OnProcessTx(const Tx& tx) {}
@@ -209,16 +214,24 @@ interface IEngEvents {
 	virtual void AddRecipient(const Address& a) {}
 };
 
+interface ICoinDbEvents {
+	virtual void OnFilterChanged() {}
+};
+
 interface COIN_CLASS WalletBase : public Object, IEngEvents {
 	typedef WalletBase class_type;
-
 public:
 	typedef InterlockedPolicy interlocked_policy;
 
 	observer_ptr<CoinEng> m_eng;
 	float Speed;
 	observer_ptr<IIWalletEvents> m_iiWalletEvents;
+#if UCFG_COIN_GENERATE
+	KeyInfo m_genKeyInfo;
 
+	mutex MtxMiner;
+	unique_ptr<BitcoinMiner> Miner;
+#endif
 	WalletBase(CoinEng & eng) : m_eng(&eng), Speed(0) {}
 
 	WalletBase() : Speed(0) {}
@@ -226,15 +239,9 @@ public:
 	CoinEng& get_Eng() { return *m_eng; }
 	DEFPROP_GET(CoinEng&, Eng);
 
-	virtual pair<CanonicalPubKey, HashValue160> GetReservedPublicKey() { Throw(E_NOTIMPL); }
 	virtual void AddRecipient(const Address& a) { Throw(E_NOTIMPL); }
 
 #if UCFG_COIN_GENERATE
-	mutex MtxMiner;
-	unique_ptr<BitcoinMiner> Miner;
-
-	CanonicalPubKey m_genPubKey;
-	HashValue160 m_genHash160;
 	void ReserveGenKey();
 	Tx CreateCoinbaseTx();
 	virtual Block CreateNewBlock();
@@ -289,7 +296,6 @@ public:
 	recursive_mutex MtxDb;
 
 	path DbWalletFilePath, DbPeersFilePath;
-	String FilenameSuffix;
 	SqliteConnection m_dbWallet;
 	SqliteCommand CmdAddNewKey;
 	SqliteCommand m_cmdIsFromMe, CmdGetBalance, CmdRecipients, CmdGetTxId, CmdGetTx, CmdGetTxes, CmdPendingTxes, CmdSetBestBlockHash, CmdFindCoin, CmdInsertCoin;
@@ -305,6 +311,9 @@ public:
 	CP2SHToKey P2SHToKey;
 
 	ptr<CoinFilter> Filter;
+	DateTime DtEarliestKey;
+
+	CSubscriber<ICoinDbEvents> Events;
 
 	thread_group m_tr;
 	ptr<Coin::MsgLoopThread> MsgLoopThread;
@@ -323,10 +332,9 @@ public:
 	~CoinDb();
 	KeyInfo AddNewKey(KeyInfo ki);
 	KeyInfo FindReservedKey(AddressType type = AddressType::P2SH);
-	void TopUpPool(int lim = KEYPOOL_SIZE);
-	KeyInfo GenerateNewAddress(AddressType type, RCString comment, int lim = KEYPOOL_SIZE);
-	void RemovePubKeyFromReserved(const CanonicalPubKey& pubKey);
-	void RemovePubHash160FromReserved(const HashValue160& hash160);
+	void TopUpPool();
+	KeyInfo GenerateNewAddress(AddressType type, RCString comment);
+	void RemoveKeyInfoFromReserved(const KeyInfo& keyInfo);
 
 	bool get_WalletDatabaseExists();
 	DEFPROP_GET(bool, WalletDatabaseExists);
@@ -334,6 +342,7 @@ public:
 	bool get_PeersDatabaseExists();
 	DEFPROP_GET(bool, PeersDatabaseExists);
 
+	void UpdateFilter();
 	void LoadKeys(RCString password = nullptr);
 	void Load();
 	KeyInfo FindMine(RCSpan scriptPubKey, ScriptContext context = ScriptContext::Top);
@@ -352,16 +361,17 @@ public:
 	KeyInfo GetMyKeyInfoByScriptHash(const HashValue160& hash160);
 	Blob GetMyRedeemScript(const HashValue160& hash160);
 
-	bool SetPrivkeyComment(const HashValue160& hash160, RCString comment);
+	KeyInfo FindPrivkey(const Address& addr);
+	bool SetPrivkeyComment(const Address& addr, RCString comment);
 	void ImportXml(const path& filepath);
 	void ImportDat(const path& filepath, RCString password);
 	void ImportWallet(const path& filepath, RCString password);
 	void ExportWalletToXml(const path& filepath);
 
-	//!!!R	void OnIpDetected(const IPAddress& ip) override;
 	P2P::Link* CreateLink(thread_group& tr) override;
 	void BanPeer(Peer& peer) override;
 	void SavePeers(int idPeersNet, const vector<ptr<Peer>>& peers);
+	bool IsFilterValid(CoinFilter* filter);
 protected:
 	void OnBestBlock(const Block& block) override;
 private:
@@ -442,10 +452,6 @@ class LocatorHashes : public vector<HashValue> {
 
 public:
 	int FindHeightInMainChain(bool bFullBlocks = false) const;
-
-	/*!!!R	int get_DistanceBack() const;
-		DEFPROP_GET(int, DistanceBack);
-		*/
 };
 
 class IBlockChainDb : public InterlockedObject, public ITransactionable {
@@ -473,6 +479,7 @@ public:
 	virtual int FindHeight(const HashValue& hash) = 0;
 	virtual BlockHeader FindHeader(int height) = 0;
 	virtual BlockHeader FindHeader(const HashValue& hash) = 0;
+	virtual BlockHeader FindHeader(const BlockRef& bref) = 0;
 	virtual optional<pair<uint64_t, uint32_t>> FindBlockOffset(const HashValue& hash) = 0;
 	virtual Block FindBlock(const HashValue& hash) = 0;
 	virtual Block FindBlock(int height) = 0;
@@ -482,7 +489,7 @@ public:
 	virtual TxHashesOutNums GetTxHashesOutNums(int height) = 0;
 	virtual pair<OutPoint, TxOut> GetOutPointTxOut(int height, int idxOut) = 0;
 	virtual void InsertBlock(const Block& block, CConnectJob& job) = 0;
-	virtual void InsertHeader(const BlockHeader& header) = 0;
+	virtual void InsertHeader(const BlockHeader& header, bool bUpdateMaxHeight) = 0;
 	virtual void DeleteBlock(int height, const vector<int64_t>* txids) = 0;
 
 	virtual bool FindTx(const HashValue& hash, Tx* ptx) = 0;
@@ -519,6 +526,9 @@ public:
 	virtual void SetLastPrunedHeight(int32_t height) {}
 	virtual Blob ReadBlob(uint64_t offset, uint32_t size) { return Blob();  }
 	virtual void CopyTo(uint64_t offset, uint32_t size, Stream& stm) { }
+
+	virtual ptr<CoinFilter> GetFilter() =0;
+	virtual void SetFilter(CoinFilter *filter) = 0;
 };
 
 ptr<IBlockChainDb> CreateBlockChainDb();
@@ -542,17 +552,24 @@ struct BlockTreeItem : public BlockHeader { // may be full block too
 
 class BlockTree {
 public:
+	CoinEng& Eng;
 	mutable mutex Mtx;
 	typedef unordered_map<HashValue, BlockTreeItem> CMap; //!!!TODO change to unordered_set<BlockTreeItem> to save space
 	CMap Map;
 	int HeightLastCheckpointed;
 	//----
 
-	BlockTree() : HeightLastCheckpointed(-1) {}
+	BlockTree(CoinEng& eng)
+		: Eng(eng)
+		, HeightLastCheckpointed(-1)
+	{}
 
+	void Clear();
 	BlockTreeItem FindInMap(const HashValue& hashBlock) const;
 	BlockHeader FindHeader(const HashValue& hashBlock) const;
-	BlockTreeItem GetHeader(const HashValue& hashBlock) const;
+	BlockHeader FindHeader(const BlockRef& bref) const;
+	BlockTreeItem GetHeader(const HashValue& hashBlock) const;	//!!!?R
+	BlockTreeItem GetHeader(const BlockRef& bref) const;
 	Block FindBlock(const HashValue& hashBlock) const;
 	Block GetBlock(const HashValue& hashBlock) const;
 	BlockHeader GetAncestor(const HashValue& hashBlock, int height) const;
@@ -569,7 +586,7 @@ public:
 	void OnCreateDatabase() override;
 	void OnCloseDatabase() override;
 	void OnBestBlock(const Block& block) override;
-	void OnProcessBlock(const Block& block) override;
+	void OnProcessBlock(const BlockHeader& block) override;
 	void OnBlockConnectDbtx(const Block& block) override;
 	void OnBeforeCommit() override;
 	void OnProcessTx(const Tx& tx) override;
@@ -620,17 +637,23 @@ public:
 	void EraseOrphanTx(const HashValue& hash);
 	void AddOrphan(const Tx& tx);
 	bool AddToPool(const Tx& tx, vector<HashValue>& vQueue);
+	void OnTxMessage(const Tx& tx);
 };
 
 class CoinConf : public Ext::Inet::P2P::P2PConf {
 public:
 	int64_t MinTxFee, MinRelayTxFee;	// Fee rate per KB (1000 bytes)
 	String RpcUser, RpcPassword;
+	String AddressType, ChangeType;
 	int RpcPort, RpcThreads;
 	int KeyPool;
 	bool Checkpoints, Server, AcceptNonStdTxn, Testnet;
 
 	CoinConf();
+	Coin::AddressType GetAddressType() { return ToAddressType(AddressType); }
+	Coin::AddressType GetChangeType() { return ChangeType.empty() ? GetAddressType() : ToAddressType(ChangeType); }
+private:
+	static Coin::AddressType ToAddressType(RCString s);
 };
 
 extern CoinConf g_conf;
@@ -641,7 +664,7 @@ enum class JumpAction {
 	, Break
 };
 
-class COIN_CLASS CoinEng : public HasherEng, public P2P::Net, public ITransactionable {
+class COIN_CLASS CoinEng : public HasherEng, public P2P::Net, public ITransactionable, public ICoinDbEvents {
 	typedef CoinEng class_type;
 	typedef P2P::Net base;
 
@@ -655,12 +678,12 @@ public:
 	ptr<IBlockChainDb> Db;
 	uint64_t OffsetInBootstrap, NextOffsetInBootstrap;
 
-	class TxPool TxPool;
-
 	BlockTree Tree;
+	class TxPool TxPool;
 
 	typedef unordered_map<HashValue, BlocksInFlightList::iterator> CMapBlocksInFlight;
 	CMapBlocksInFlight MapBlocksInFlight;
+	//----
 
 	std::exception_ptr CriticalException;
 
@@ -670,13 +693,12 @@ public:
 
 	static const int HEIGHT_BOOTSTRAPING = -2;
 	int UpgradingDatabaseHeight;
+	bool Rescanning;
 
 	mutex m_mtxStates;
 	set<String> m_setStates;
 
-#if 1
-	ptr<Coin::ChannelClient> ChannelClient;
-#endif
+	ptr<Coin::ChannelClient> ChannelClient;		//!!!?
 	ptr<CoinFilter> Filter;
 
 	path m_dbFilePath;
@@ -688,6 +710,7 @@ public:
 	atomic<int> aSyncStartedPeers;
 
 	uint16_t MaxBlockVersion; //!!!Obsolete, never used
+	Opcode MaxOpcode;
 	CBool InWalJournalMode;
 	CBool JournalModeDelete;
 	CBool m_dbTxBegin;
@@ -734,7 +757,8 @@ public:
 	void SetBestHeader(const BlockHeader& bh);
 	int BestHeaderHeight();
 
-	Block BestBlock();
+	BlockHeader BestBlock();
+	void SetBestBlock(const BlockHeader& b);
 	void SetBestBlock(const Block& b);
 	int BestBlockHeight();
 
@@ -753,6 +777,7 @@ public:
 	bool IsFromMe(const Tx& tx);
 	void Push(const Inventory& inv);
 	void Push(const TxInfo& txInfo);
+	void Broadcast(CoinMessage* m);
 	void ExportToBootstrapDat(const path& pathBoostrap);
 	virtual void ClearByHeightCaches();
 	Block GetBlockByHeight(uint32_t height);
@@ -765,6 +790,7 @@ public:
 
 	String BlockStringId(const HashValue& hashBlock);
 	virtual HashValue HashMessage(RCSpan cbuf);
+	virtual HashValue HashForWallet(RCSpan s);
 	virtual HashValue HashForSignature(RCSpan cbuf);
 	virtual HashValue HashFromTx(const Tx& tx, bool widnessAware = false);
 
@@ -841,7 +867,6 @@ public:
     virtual CoinMessage* CreateSendCompactBlockMessage();
     virtual CoinMessage* CreateCompactBlockMessage();
 
-
 	virtual TxObj* CreateTxObj() { return new TxObj; }
 	virtual bool CreateDb();
 	virtual bool OpenDb();
@@ -851,6 +876,19 @@ public:
 	void Commit() override {}
 	void Rollback() override {}
 
+	virtual void SetPolicyFlags(int height);
+	virtual void VerifySignature(SignatureHasher& sigHasher, RCSpan scriptPk);		//!!!? never overridden
+	virtual void PatchSigHasher(SignatureHasher& sigHasher) {}
+	virtual void CheckHashType(SignatureHasher& sigHasher, uint32_t sigHashType) {}
+	virtual bool IsCheckSigOp(Opcode opcode);
+	virtual int GetMaxSigOps(const Block& block) { return MAX_BLOCK_SIGOPS_COST; }
+	virtual void CheckBlock(const Block& block) {}
+	virtual void OrderTxes(CTxes& txes) {}
+
+	void ConnectTx(CConnectJob& job, vector<shared_future<TxFeeTuple>>& futsTx, const Tx& tx, int height, bool bVerifySignature);
+	virtual vector<shared_future<TxFeeTuple>> ConnectBlockTxes(CConnectJob& job, const vector<Tx>& txes, int height);
+	virtual bool CoinEng::IsValidSignatureEncoding(RCSpan sig);
+	virtual bool VerifyHash(RCSpan pubKey, const HashValue& hash, RCSpan sig);
 protected:
 	void StartDns();
 #if UCFG_COIN_USE_IRC
@@ -874,11 +912,32 @@ protected:
 	virtual int GetIntervalForCalculatingTarget(int height);
 	Target KimotoGravityWell(const BlockHeader& headerLast, const Block& block, int minBlocks, int maxBlocks);
 	virtual TimeSpan AdjustSpan(int height, const TimeSpan& span, const TimeSpan& targetSpan);
-	virtual TimeSpan GetActualSpanForCalculatingTarget(const BlockObj& bo, int nInterval);
+	virtual BlockHeader GetFirstHeaderOfInterval(const BlockObj& bo, int nInterval);
+	virtual TimeSpan GetActualSpanForCalculatingTarget(const BlockHeader& firstHeader, const BlockObj& bo);
 	virtual Target GetNextTargetRequired(const BlockHeader& headerLast, const Block& block);
 	virtual void UpdateMinFeeForTxOuts(int64_t& minFee, const int64_t& baseFee, const Tx& tx);
 	virtual path VGetDbFilePath();
 
+	virtual void OpCat(VmStack& stack);
+	virtual void OpSubStr(VmStack& stack);
+	virtual void OpLeft(VmStack& stack);
+	virtual void OpRight(VmStack& stack);
+	virtual void OpSize(VmStack& stack);
+	virtual void OpInvert(VmStack& stack);
+	virtual void OpAnd(VmStack& stack);
+	virtual void OpOr(VmStack& stack);
+	virtual void OpXor(VmStack& stack);
+	virtual void Op2Mul(VmStack& stack);
+	virtual void Op2Div(VmStack& stack);
+	virtual void OpMul(VmStack& stack);
+	virtual void OpDiv(VmStack& stack);
+	virtual void OpMod(VmStack& stack);
+	virtual void OpLShift(VmStack& stack);
+	virtual void OpRShift(VmStack& stack);
+	virtual void OpCheckDataSig(VmStack& stack);
+	virtual void OpCheckDataSigVerify(VmStack& stack);
+
+	void OnFilterChanged() override;
 private:
 	void LoadPeers();
 	void UpgradeTo(const Version& ver);
@@ -892,7 +951,9 @@ private:
 	friend class VersionMessage;
 	friend class CoinMessage;
 	friend class TxPool;
+	friend class Vm;
 };
+
 
 class CoinEngTransactionScope : noncopyable {
 public:

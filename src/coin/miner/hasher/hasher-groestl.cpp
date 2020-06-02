@@ -1,4 +1,4 @@
-/*######   Copyright (c) 2015 Ufasoft  http://ufasoft.com  mailto:support@ufasoft.com,  Sergey Pavlov  mailto:dev@ufasoft.com ####
+/*######   Copyright (c) 2015-2019 Ufasoft  http://ufasoft.com  mailto:support@ufasoft.com,  Sergey Pavlov  mailto:dev@ufasoft.com ####
 #                                                                                                                                     #
 # 		See LICENSE for licensing information                                                                                         #
 #####################################################################################################################################*/
@@ -12,15 +12,15 @@ namespace Coin {
 class GroestlHasher : public Hasher {
 public:
 	GroestlHasher()
-		:	Hasher("groestl", HashAlgo::Groestl)
+		: Hasher("groestl", HashAlgo::Groestl)
 	{}
 
-	HashValue CalcHash(const ConstBuf& cbuf) override {
+	HashValue CalcHash(RCSpan cbuf) override {
 		return GroestlHash(cbuf);
 	}
-
 } g_groestlHasher;
 
-
+Hasher& GetGroestlcoinHasher() { return g_groestlHasher; }	//!!!?
 
 } // Coin::
+
